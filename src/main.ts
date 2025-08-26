@@ -128,7 +128,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private settingsState = new Map<string, any>();
   private getGlobal: (key: string) => string | undefined;
 
-  // NEW: race-safety & lifecycle flags
+  // race-safety & lifecycle flags
   private globalsDebounce?: NodeJS.Timeout;
   private isRescheduling = false;
   private rescheduleQueued = false;
@@ -143,12 +143,23 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   }
 
   notifyGlobalsChanged() {
+    if (this.released) return;
+
     this.console?.log?.('[Day/Night] Globals changed → reschedule');
+
     if (this.globalsDebounce) {
       clearTimeout(this.globalsDebounce);
       this.globalsDebounce = undefined;
     }
+
     this.globalsDebounce = setTimeout(() => {
+      this.globalsDebounce = undefined;
+
+      if (this.isRescheduling) {
+        this.rescheduleQueued = true;
+        return;
+      }
+
       this.rescheduleAll().catch(e =>
         this.console?.error?.('Reschedule after globals change failed:', e)
       );
@@ -488,6 +499,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   }
 
   async putMixinSetting(key: string, value: SettingValue) {
+    if (this.released) return;
     this.console?.log?.(`[Day/Night] Setting ${key} = ${value} (type: ${typeof value})`);
 
     if (key === '__btn_preview') { await this.previewSchedule(); return; }
@@ -603,6 +615,8 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private actionSettings(which: 'day' | 'night', label: string): Setting[] {
     const prefix = `${which}.`;
     const subgroup = `${label} Action`;
+    const get = (k: string, d = '') => this.getValue(prefix + k, d);
+
     return [
       {
         key: prefix + 'url',
@@ -610,7 +624,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         group: GROUP,
         subgroup,
         type: 'string' as const,
-        value: this.getValue(prefix + 'url'),
+        value: get('url'),
         description: `Full URL to switch to ${label.toLowerCase()} mode (e.g. http://camera/cgi-bin/…).`,
       },
       {
@@ -619,7 +633,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         group: GROUP,
         subgroup,
         type: 'string' as const,
-        value: this.getValue(prefix + 'method', 'GET'),
+        value: get('method', 'GET'),
         choices: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
         combobox: true,
         description: `HTTP method to call the ${label} URL.`,
@@ -630,7 +644,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         group: GROUP,
         subgroup,
         type: 'string' as const,
-        value: this.getValue(prefix + 'contentType', ''),
+        value: get('contentType', ''),
         description: 'Only used when the method has a body (POST/PUT/PATCH/DELETE).',
       },
       {
@@ -639,7 +653,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         group: GROUP,
         subgroup,
         type: 'textarea' as const,
-        value: this.getValue(prefix + 'headers', ''),
+        value: get('headers', ''),
         description: 'JSON object with additional headers, e.g. {"X-Token":"abc"}.',
       },
       {
@@ -648,7 +662,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         group: GROUP,
         subgroup,
         type: 'textarea' as const,
-        value: this.getValue(prefix + 'body', ''),
+        value: get('body', ''),
         description: 'Optional request body (POST/PUT/PATCH/DELETE).',
       },
     ];
@@ -737,7 +751,8 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     this.isRescheduling = true;
     try {
       this.clearTimers();
-      // New schedule version: any old timers that fire later will be ignored.
+
+      // new schedule version; stale timers will be ignored
       this.scheduleVersion++;
 
       const c = this.readConfig();
@@ -797,13 +812,23 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
       this.scheduleAt(nextSunrise, () => {
         this.switchPhase('day');
-        const t = setTimeout(() => this.rescheduleAll(), 60_000);
+        // gated 60s follow-up reschedule
+        const v = this.scheduleVersion;
+        const t = setTimeout(() => {
+          if (this.released || v !== this.scheduleVersion) return;
+          this.rescheduleAll();
+        }, 60_000);
         this.timers.push(t);
       });
 
       this.scheduleAt(nextSunset, () => {
         this.switchPhase('night');
-        const t = setTimeout(() => this.rescheduleAll(), 60_000);
+        // gated 60s follow-up reschedule
+        const v = this.scheduleVersion;
+        const t = setTimeout(() => {
+          if (this.released || v !== this.scheduleVersion) return;
+          this.rescheduleAll();
+        }, 60_000);
         this.timers.push(t);
       });
 
@@ -874,15 +899,19 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const delay = Math.min(MAX_DELAY_MS, Math.max(0, raw));
     if (delay > 0) {
       const myVersion = this.scheduleVersion;
+      const what = label === 'recalc' ? 'recompute' : 'action';
       const timer = setTimeout(() => {
         if (this.released || myVersion !== this.scheduleVersion)
           return; // ignore stale timers
-        fn();
+        try {
+          fn();
+        } catch (e: any) {
+          this.console?.error?.(`[Day/Night] Scheduled ${what} threw:`, e?.message || e);
+        }
       }, delay);
       this.timers.push(timer);
       const hours = Math.floor(delay / 3_600_000);
       const minutes = Math.floor((delay % 3_600_000) / 60_000);
-      const what = label === 'recalc' ? 'recompute' : 'action';
       this.console?.log?.(`[Day/Night] Scheduled ${what} in ${hours}h ${minutes}m at ${this.formatLocal(when)}`);
     }
   }
