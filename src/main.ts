@@ -135,9 +135,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     this.initializeScheduling();
   }
 
+  private globalsDebounce?: NodeJS.Timeout;
+
   notifyGlobalsChanged() {
     this.console?.log?.('[Day/Night] Globals changed → reschedule');
-    this.rescheduleAll().catch(e => this.console?.error?.('Reschedule after globals change failed:', e));
+    clearTimeout(this.globalsDebounce);
+    this.globalsDebounce = setTimeout(() => {
+      this.rescheduleAll().catch(e => this.console?.error?.('Reschedule after globals change failed:', e));
+    }, 300); // tweak if you like
   }
 
   private loadSettingsFromStorage() {
@@ -464,7 +469,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
           subgroup: 'Reliability & Logging',
           type: 'boolean' as const,
           value: this.getValue('logResponses', 'false') === 'true',
-          description: 'Logs status and up to 500 chars of response body.',
+          description: 'Log status and the response body (chunked, capped at ~64 KB).',
         },
       );
     }
@@ -522,25 +527,65 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const x = Number(s);
     return Number.isFinite(x) ? x : undefined;
   }
+
   private getString(k: string, def?: string) {
     const val = this.getValue(k, def);
     return val !== undefined && val !== null ? String(val) : def;
   }
+
   private getBool(k: string, def = false) {
     const val = this.getValue(k);
     if (val === true || val === 'true') return true;
     if (val === false || val === 'false') return false;
     return def;
   }
+
   private allowBody(method: string) {
     return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method.toUpperCase());
   }
+
+  private static readonly MAX_LOG_BYTES = 64 * 1024; // 64KB safety cap
+
+  private logBodyChunks(
+    phase: 'day' | 'night',
+    statusLine: string,
+    body: string,
+    contentType?: string,
+    chunk = 800,
+  ) {
+    // Skip obviously non-text payloads
+    const ct = (contentType || '').toLowerCase();
+    const isTextish = /^(text\/|application\/(json|xml|x-www-form-urlencoded))/.test(ct) || !ct;
+    if (!isTextish) {
+      this.console?.log?.(`[Day/Night] ${phase} response: ${statusLine}; content-type=${contentType || '(unknown)'}; body not logged (non-text).`);
+      return;
+    }
+
+    let logged = 0;
+    const total = body.length;
+    const cap = Math.min(total, DayNightMixin.MAX_LOG_BYTES);
+
+    this.console?.log?.(`[Day/Night] ${phase} response: ${statusLine}; content-type=${contentType || '(unknown)'}; body length=${total}${total > cap ? ` (logging first ${cap} bytes)` : ''}`);
+
+    for (let i = 0; i < cap; i += chunk) {
+      const part = body.slice(i, Math.min(i + chunk, cap));
+      this.console?.log?.(`[Day/Night] body[${i}-${Math.min(i + chunk, cap)}]: ${part}`);
+      logged += part.length;
+    }
+
+    if (cap < total) {
+      this.console?.log?.(`[Day/Night] body truncated: logged ${logged}/${total} bytes`);
+    }
+  }
+
   private safeTime(dt: Date | undefined) {
     return dt && !Number.isNaN(dt.getTime()) ? dt : undefined;
   }
+
   private formatCoord(n?: number) {
     return (typeof n === 'number' && Number.isFinite(n)) ? n.toFixed(6) : '—';
   }
+
   private formatSigned(n: number) {
     return n >= 0 ? `+${n}` : `${n}`;
   }
@@ -683,7 +728,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     this.scheduleAt(nextRecalc, () => {
       sunTimesCache.clear();
       this.rescheduleAll();
-    });
+    }, 'recalc');
 
     const guard = !c.enabled
       ? undefined
@@ -795,15 +840,16 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     return new Date(dt.getTime() + offsetMs);
   }
 
-  private scheduleAt(when: Date, fn: () => void) {
+  private scheduleAt(when: Date, fn: () => void, label: 'action' | 'recalc' = 'action') {
     const raw = when.getTime() - Date.now();
     const delay = Math.min(MAX_DELAY_MS, Math.max(0, raw));
     if (delay > 0) {
       const timer = setTimeout(fn, delay);
       this.timers.push(timer);
-      const hours = Math.floor(delay / 3600000);
-      const minutes = Math.floor((delay % 3600000) / 60000);
-      this.console?.log?.(`[Day/Night] Scheduled action in ${hours}h ${minutes}m at ${this.formatLocal(when)}`);
+      const hours = Math.floor(delay / 3_600_000);
+      const minutes = Math.floor((delay % 3_600_000) / 60_000);
+      const what = label === 'recalc' ? 'recompute' : 'action';
+      this.console?.log?.(`[Day/Night] Scheduled ${what} in ${hours}h ${minutes}m at ${this.formatLocal(when)}`);
     }
   }
 
@@ -916,8 +962,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         if (bodyAllowed && action.body) init.body = action.body;
         const response = await this.digestFetchWithTimeout(client, action.url!, init, 10_000);
         const responseText = await response.text().catch(() => '');
-        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}${responseText ? `: ${responseText.slice(0, 200)}` : ''}`);
-        if (c.logResponses) this.console?.log?.(`[Day/Night] ${phase} response: HTTP ${response.status} ${response.statusText}; body: ${responseText.slice(0, 500)}`);
+        const statusLine = `HTTP ${response.status} ${response.statusText}`;
+        const ct = response.headers.get('content-type') || undefined;
+        if (c.logResponses) {
+          this.logBodyChunks(phase, statusLine, responseText, ct);
+        }
+        if (!response.ok) {
+          throw new Error(statusLine);
+        }
         return;
       } else {
         const fetchHeaders = { ...headers };
@@ -929,8 +981,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         if (bodyAllowed && action.body) init.body = action.body;
         const response = await this.fetchWithTimeout(action.url!, init, 10000);
         const responseText = await response.text().catch(() => '');
-        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}${responseText ? `: ${responseText.slice(0, 200)}` : ''}`);
-        if (c.logResponses) this.console?.log?.(`[Day/Night] ${phase} response: HTTP ${response.status} ${response.statusText}; body: ${responseText.slice(0, 500)}`);
+        const statusLine = `HTTP ${response.status} ${response.statusText}`;
+        const ct = response.headers.get('content-type') || undefined;
+        if (c.logResponses) {
+          this.logBodyChunks(phase, statusLine, responseText, ct);
+        }
+        if (!response.ok) {
+          throw new Error(statusLine);
+        }
       }
     }, c.retries, c.retryBaseDelayMs);
   }
