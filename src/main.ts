@@ -221,10 +221,10 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const g = (k: string) => this.getGlobal?.(k);
     const glat = g?.('latitude') ?? '';
     const glon = g?.('longitude') ?? '';
-    const gtz  = g?.('timeZone') ?? '';
+    const gtz = g?.('timeZone') ?? '';
     const g24h = (g?.('use24h') ?? 'true') === 'true';
     const gSunriseOff = g?.('sunriseOffsetMins') ?? '0';
-    const gSunsetOff  = g?.('sunsetOffsetMins')  ?? '0';
+    const gSunsetOff = g?.('sunsetOffsetMins') ?? '0';
 
     const settings: Setting[] = [];
 
@@ -481,9 +481,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     this.console?.log?.(`[Day/Night] Setting ${key} = ${value} (type: ${typeof value})`);
 
     if (key === '__btn_preview') { await this.previewSchedule(); return; }
-    if (key === '__btn_day')     { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Day with switching disabled.'); await this.switchPhase('day'); return; }
-    if (key === '__btn_night')   { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Night with switching disabled.'); await this.switchPhase('night'); return; }
-    
+    if (key === '__btn_day') { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Day with switching disabled.'); await this.switchPhase('day'); return; }
+    if (key === '__btn_night') { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Night with switching disabled.'); await this.switchPhase('night'); return; }
+
     value = normaliseSetting(key, value);
 
     if (key === 'enabled' && (value === true || value === 'true')) {
@@ -506,7 +506,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       'retries', 'retryBaseDelayMs', 'logResponses',
     ].includes(key)) {
       const isEnabling = (key === 'enabled' && (value === true || value === 'true'));
-      const isEnabled  = this.getValue('enabled') === 'true';
+      const isEnabled = this.getValue('enabled') === 'true';
       if (isEnabling || (key !== 'enabled' && isEnabled)) {
         this.console?.log?.('[Day/Night] Rescheduling due to setting change');
         this.rescheduleAll().catch(e => this.console?.error?.('[Day/Night] Failed to reschedule:', e));
@@ -658,7 +658,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       const v = g(k);
       if (v == null) return d;
       return v === 'true' ? true
-          : v === 'false' ? false
+        : v === 'false' ? false
           : d;
     };
 
@@ -666,18 +666,18 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const overrideRel = this.getBool('overrideReliability', false);
     const overrideOff = this.getBool('overrideOffsets', false);
 
-    const latitude  = overrideLoc ? this.n('latitude')  : gNum('latitude');
+    const latitude = overrideLoc ? this.n('latitude') : gNum('latitude');
     const longitude = overrideLoc ? this.n('longitude') : gNum('longitude');
-    const timeZone  = overrideLoc ? this.getString('timeZone') : (g('timeZone') || undefined);
-    const use24h    = overrideLoc ? this.getBool('use24h', true) : gBool('use24h', true);
+    const timeZone = overrideLoc ? this.getString('timeZone') : (g('timeZone') || undefined);
+    const use24h = overrideLoc ? this.getBool('use24h', true) : gBool('use24h', true);
     const syncOnStartup = overrideLoc ? this.getBool('syncOnStartup', true) : gBool('syncOnStartup', true);
 
     const sunriseOffsetMins = (overrideOff ? this.n('sunriseOffsetMins') : gNum('sunriseOffsetMins')) ?? 0;
-    const sunsetOffsetMins  = (overrideOff ? this.n('sunsetOffsetMins')  : gNum('sunsetOffsetMins'))  ?? 0;
+    const sunsetOffsetMins = (overrideOff ? this.n('sunsetOffsetMins') : gNum('sunsetOffsetMins')) ?? 0;
 
-    const retries          = overrideRel ? (this.n('retries') ?? undefined)          : gNum('retries');
+    const retries = overrideRel ? (this.n('retries') ?? undefined) : gNum('retries');
     const retryBaseDelayMs = overrideRel ? (this.n('retryBaseDelayMs') ?? undefined) : gNum('retryBaseDelayMs');
-    const logResponses     = overrideRel ? this.getBool('logResponses', false)       : gBool('logResponses', false);
+    const logResponses = overrideRel ? this.getBool('logResponses', false) : gBool('logResponses', false);
 
     return {
       enabled: this.getBool('enabled'),
@@ -742,8 +742,8 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
 
     if (!isNum(c.latitude!) || !isNum(c.longitude!) ||
-        c.latitude! < -90 || c.latitude! > 90 ||
-        c.longitude! < -180 || c.longitude! > 180) {
+      c.latitude! < -90 || c.latitude! > 90 ||
+      c.longitude! < -180 || c.longitude! > 180) {
       this.console?.warn?.('[Day/Night] Invalid latitude/longitude; scheduling skipped.');
       this.saveToStorage('preview', 'Invalid latitude/longitude');
       this.saveToStorage('previewHtml', '<div style="color:#b00">Location not configured (lat/long).</div>');
@@ -752,7 +752,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
     const todayTimesRaw = getSunTimesCached(now, c.latitude!, c.longitude!);
     const sunriseTodayRaw = this.safeTime(todayTimesRaw.sunrise);
-    const sunsetTodayRaw  = this.safeTime(todayTimesRaw.sunset);
+    const sunsetTodayRaw = this.safeTime(todayTimesRaw.sunset);
 
     if (!sunriseTodayRaw || !sunsetTodayRaw) {
       this.console?.warn?.('[Day/Night] No sunrise/sunset for this date at the configured location.');
@@ -762,18 +762,18 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
 
     const todaySunrise = this.applyOffset(sunriseTodayRaw, c.sunriseOffsetMins);
-    const todaySunset  = this.applyOffset(sunsetTodayRaw,  c.sunsetOffsetMins);
+    const todaySunset = this.applyOffset(sunsetTodayRaw, c.sunsetOffsetMins);
 
     const tomorrow = new Date(now);
     tomorrow.setDate(now.getDate() + 1);
     const tomorrowTimesRaw = getSunTimesCached(tomorrow, c.latitude!, c.longitude!);
     const sunriseTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunrise);
-    const sunsetTomorrowRaw  = this.safeTime(tomorrowTimesRaw.sunset);
+    const sunsetTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunset);
 
     const nextSunrise = (todaySunrise.getTime() > now.getTime() ? todaySunrise :
-                        (sunriseTomorrowRaw ? this.applyOffset(sunriseTomorrowRaw, c.sunriseOffsetMins) : todaySunrise));
-    const nextSunset  = (todaySunset.getTime() > now.getTime() ? todaySunset :
-                        (sunsetTomorrowRaw ? this.applyOffset(sunsetTomorrowRaw, c.sunsetOffsetMins) : todaySunset));
+      (sunriseTomorrowRaw ? this.applyOffset(sunriseTomorrowRaw, c.sunriseOffsetMins) : todaySunrise));
+    const nextSunset = (todaySunset.getTime() > now.getTime() ? todaySunset :
+      (sunsetTomorrowRaw ? this.applyOffset(sunsetTomorrowRaw, c.sunsetOffsetMins) : todaySunset));
 
     this.scheduleAt(nextSunrise, () => {
       this.switchPhase('day');
@@ -811,7 +811,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
   private checkCurrentPhase(now: Date, sunriseRaw: Date, sunsetRaw: Date, sunriseOffset: number, sunsetOffset: number) {
     const actualSunrise = new Date(sunriseRaw.getTime() + (sunriseOffset || 0) * 60000);
-    const actualSunset  = new Date(sunsetRaw.getTime()  + (sunsetOffset  || 0) * 60000);
+    const actualSunset = new Date(sunsetRaw.getTime() + (sunsetOffset || 0) * 60000);
     const currentTime = now.getTime();
 
     const expectedPhase: 'day' | 'night' =
@@ -1046,7 +1046,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
   ) {
     const nextIsSunrise = nextSunrise.getTime() < nextSunset.getTime();
-    const nextWhen  = nextIsSunrise ? nextSunrise : nextSunset;
+    const nextWhen = nextIsSunrise ? nextSunrise : nextSunset;
     const nextPhase = nextIsSunrise ? 'Day' : 'Night';
     const tz = tzLabel ? ` (${tzLabel})` : '';
     const ICON_GAP_PX = 8;
@@ -1101,7 +1101,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
     const todayTimesRaw = getSunTimesCached(now, c.latitude!, c.longitude!);
     const sunriseTodayRaw = this.safeTime(todayTimesRaw.sunrise);
-    const sunsetTodayRaw  = this.safeTime(todayTimesRaw.sunset);
+    const sunsetTodayRaw = this.safeTime(todayTimesRaw.sunset);
     if (!sunriseTodayRaw || !sunsetTodayRaw) {
       this.saveToStorage('preview', 'No sunrise/sunset today at this location');
       this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset at this location today.</div>');
@@ -1109,13 +1109,13 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
 
     const todaySunrise = this.applyOffset(sunriseTodayRaw, c.sunriseOffsetMins);
-    const todaySunset  = this.applyOffset(sunsetTodayRaw,  c.sunsetOffsetMins);
+    const todaySunset = this.applyOffset(sunsetTodayRaw, c.sunsetOffsetMins);
 
     const tomorrow = new Date(now);
     tomorrow.setDate(now.getDate() + 1);
     const tomorrowTimesRaw = getSunTimesCached(tomorrow, c.latitude!, c.longitude!);
     const sunriseTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunrise);
-    const sunsetTomorrowRaw  = this.safeTime(tomorrowTimesRaw.sunset);
+    const sunsetTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunset);
 
     const nextSunrise = todaySunrise.getTime() > now.getTime()
       ? todaySunrise
@@ -1158,8 +1158,10 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     const get = (k: string, d?: string) => g.getItem(k) ?? d;
 
     return [
-      { key: 'h_loc', type: 'html' as const, readonly: true,
-        value: '<h3 style="margin:8px 0">Location &amp; Time</h3>' },
+      {
+        key: 'h_loc', type: 'html' as const, readonly: true,
+        value: '<h3 style="margin:8px 0">Location &amp; Time</h3>'
+      },
 
       {
         key: 'global.latitude',
@@ -1218,8 +1220,10 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
         description: 'Default for all cameras. Positive = after sunset; negative = before.',
       },
 
-      { key: 'h_rel', type: 'html' as const, readonly: true,
-        value: '<h3 style="margin:16px 0 8px">Reliability defaults</h3>' },
+      {
+        key: 'h_rel', type: 'html' as const, readonly: true,
+        value: '<h3 style="margin:16px 0 8px">Reliability defaults</h3>'
+      },
 
       {
         key: 'global.retries',
@@ -1256,7 +1260,7 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     this.storage.setItem(key, v);
 
     for (const m of mixinsById.values()) {
-      try { m.notifyGlobalsChanged(); } catch {}
+      try { m.notifyGlobalsChanged(); } catch { }
     }
   }
 
@@ -1284,7 +1288,7 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     // If a previous instance exists for this device, release it defensively.
     const prev = mixinsById.get(key);
     if (prev && prev !== mixin) {
-      try { await prev.release(); } catch {}
+      try { await prev.release(); } catch { }
       await new Promise(r => setTimeout(r, 0)); // let event loop clear any pending callbacks
     }
 
