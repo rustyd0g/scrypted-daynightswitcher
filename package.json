@@ -1,0 +1,54 @@
+{
+  "name": "@rustyd0g/scrypted-daynightswitcher",
+  "version": "1.0.0",
+  "description": "Per-camera sunrise/sunset day/night profile switcher (Scrypted mixin).",
+  "author": "rustyd0g",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rustyd0g/scrypted-daynightswitcher"
+  },
+  "keywords": [
+    "scrypted",
+    "plugin",
+    "camera",
+    "daynight",
+    "automation",
+    "hikvision",
+    "dahua",
+    "amcrest"
+  ],
+  "scripts": {
+    "scrypted-setup-project": "scrypted-setup-project",
+    "prescrypted-setup-project": "scrypted-package-json",
+    "build": "scrypted-webpack",
+    "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+    "prescrypted-vscode-launch": "scrypted-webpack",
+    "scrypted-vscode-launch": "scrypted-deploy-debug",
+    "scrypted-deploy-debug": "scrypted-deploy-debug",
+    "scrypted-debug": "scrypted-debug",
+    "scrypted-deploy": "scrypted-deploy",
+    "scrypted-readme": "scrypted-readme",
+    "scrypted-package-json": "scrypted-package-json"
+  },
+  "scrypted": {
+    "name": "Day/Night Switcher",
+    "type": "Program",
+    "interfaces": [
+      "MixinProvider",
+      "Settings"
+    ],
+    "rollup": true
+  },
+  "dependencies": {
+    "@scrypted/sdk": "^0.5.29",
+    "digest-fetch": "3.1.1",
+    "node-fetch": "2.6.9",
+    "suncalc": "1.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "@types/suncalc": "1.9.2",
+    "typescript": "^5.5.4"
+  }
+}
