@@ -135,6 +135,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private released = false;
   private scheduleVersion = 0;
 
+  // heartbeat watchdog (interval)
+  private heartbeat?: NodeJS.Timeout;
+
   constructor(options: DayNightMixinOptions) {
     super(options);
     this.getGlobal = options.getGlobal;
@@ -535,6 +538,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       } else if (key === 'enabled' && (value === false || value === 'false')) {
         this.console?.log?.('[Day/Night] Disabling schedules');
         this.clearTimers();
+        this.stopHeartbeat();
         this.saveToStorage('preview', 'Switching is disabled');
         this.saveToStorage('previewHtml', '<div style="opacity:.7">Switching is disabled.</div>');
       }
@@ -739,6 +743,24 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     this.timers = [];
   }
 
+  private startHeartbeat() {
+    if (this.heartbeat) return;
+    this.heartbeat = setInterval(() => {
+      if (!this.released) {
+        this.rescheduleAll().catch(e =>
+          this.console?.error?.('[Day/Night] Heartbeat reschedule failed:', e)
+        );
+      }
+    }, 3 * 3600_000); // every 3 hours
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = undefined;
+    }
+  }
+
   private async rescheduleAll() {
     if (this.released) return;
 
@@ -758,17 +780,15 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       const c = this.readConfig();
       const now = new Date();
 
+      // heartbeat replaces one-shot "guard" — keep it running only when enabled
+      if (c.enabled) this.startHeartbeat(); else this.stopHeartbeat();
+
       const jitter = Math.floor(Math.random() * 60_000);
       const nextRecalc = new Date(now.getTime() + 3600_000 + jitter);
       this.scheduleAt(nextRecalc, () => {
         sunTimesCache.clear();
         this.rescheduleAll();
       }, 'recalc');
-
-      const guard = !c.enabled
-        ? undefined
-        : setTimeout(() => this.rescheduleAll(), 6 * 3600_000);
-      if (guard) this.timers.push(guard);
 
       if (!c.enabled) {
         this.console?.log?.('[Day/Night] Scheduling disabled');
@@ -1206,11 +1226,12 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   async release() {
     this.released = true;
     this.clearTimers();
+    this.stopHeartbeat();
     if (this.globalsDebounce) {
       clearTimeout(this.globalsDebounce);
       this.globalsDebounce = undefined;
     }
-    this.console?.log?.('[Day/Night] Mixin released, timers/debounces cleared');
+    this.console?.log?.('[Day/Night] Mixin released, timers/heartbeat/debounces cleared');
   }
 }
 
