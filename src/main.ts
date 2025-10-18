@@ -21,10 +21,10 @@ const MAX_DELAY_MS = 24 * 3600_000;
 
 const mixinsById = new Map<string, DayNightMixin>();
 
-function mixinKey(mixinDevice: any, idFromFramework?: string) {
+function mixinKey(mixinDevice: any, idFromFramework?: string): string {
   const key = idFromFramework ?? mixinDevice?.id ?? mixinDevice?.nativeId;
   if (!key) {
-    throw new Error('[Day/Night] Could not determine a stable mixin key (no id/nativeId)');
+    throw new Error('[Day/Night] Could not determine mixin key');
   }
   return String(key);
 }
@@ -1357,6 +1357,45 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     mixinDeviceInterfaces: ScryptedInterface[],
     mixinDeviceState: WritableDeviceState,
   ): Promise<any> {
+    // Get the actual device ID by calling the function or using state
+    let deviceId: string | undefined;
+    
+    try {
+      // Try mixinDeviceState.id first (it's a property, not a function)
+      deviceId = mixinDeviceState?.id;
+      
+      // If not available, try calling the mixinDevice functions
+      if (!deviceId && typeof mixinDevice?.id === 'function') {
+        deviceId = await mixinDevice.id();
+      }
+      if (!deviceId && typeof mixinDevice?.nativeId === 'function') {
+        deviceId = await mixinDevice.nativeId();
+      }
+    } catch (e) {
+      this.console?.error?.('[Day/Night] Error getting device ID:', e);
+    }
+    
+    if (!deviceId) {
+      this.console?.error?.('[Day/Night] Could not determine device ID!');
+      throw new Error('[Day/Night] No device ID available');
+    }
+    
+    const key = String(deviceId);
+    
+    // Check for existing mixin and release it
+    const prev = mixinsById.get(key);
+    if (prev) {
+      this.console?.log?.(`[Day/Night] Replacing existing mixin for ${key}`);
+      try { 
+        await prev.release(); 
+      } catch (e) {
+        this.console?.warn?.('[Day/Night] Error releasing previous mixin:', (e as any)?.message ?? e);
+      }
+      mixinsById.delete(key);
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    // Create new mixin
     const mixin = new DayNightMixin({
       groupKey: GROUP_KEY,
       group: GROUP,
@@ -1367,15 +1406,8 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
       getGlobal: (k: string) => this.storage.getItem(`global.${k}`) ?? undefined,
     });
 
-    const key = mixinKey(mixinDevice);
-    // If a previous instance exists for this device, release it defensively.
-    const prev = mixinsById.get(key);
-    if (prev && prev !== mixin) {
-      try { await prev.release(); } catch {}
-      await new Promise(r => setTimeout(r, 0)); // let event loop clear any pending callbacks
-    }
-
     mixinsById.set(key, mixin);
+    
     return mixin;
   }
 
@@ -1391,5 +1423,23 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     }
 
     this.console?.log?.(`[Day/Night] Released mixin for device ${id}`);
+  }
+
+  async release() {
+    this.console?.log?.('[Day/Night] Provider releasing, cleaning up all mixins...');
+    
+    const releasePromises: Promise<void>[] = [];
+    for (const [key, mixin] of mixinsById.entries()) {
+      releasePromises.push(
+        mixin.release().catch(e => {
+          this.console?.warn?.(`[Day/Night] Error releasing mixin ${key}:`, e?.message ?? e);
+        })
+      );
+    }
+    
+    await Promise.all(releasePromises);
+    mixinsById.clear();
+    
+    this.console?.log?.('[Day/Night] Provider released, all mixins cleaned up');
   }
 }
