@@ -7,3 +7,7 @@ src
 .vscode
 dist/*.js
 .venv
+.nvmrc
+test
+.github
+tsconfig*.json

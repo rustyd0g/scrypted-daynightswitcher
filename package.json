@@ -1,6 +1,6 @@
 {
   "name": "@rustyd0g/scrypted-daynightswitcher",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Per-camera sunrise/sunset day/night profile switcher.",
   "author": "rustyd0g",
   "license": "MIT",
@@ -22,6 +22,8 @@
     "scrypted-setup-project": "scrypted-setup-project",
     "prescrypted-setup-project": "scrypted-package-json",
     "build": "scrypted-webpack",
+    "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types test/*.test.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "prepublishOnly": "NODE_ENV=production scrypted-webpack",
     "prescrypted-vscode-launch": "scrypted-webpack",
     "scrypted-vscode-launch": "scrypted-deploy-debug",
@@ -48,6 +50,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.10",
+    "@types/node-fetch": "^2.6.13",
     "@types/suncalc": "1.9.2",
     "typescript": "^5.5.4"
   }

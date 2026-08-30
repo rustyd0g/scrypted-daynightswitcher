@@ -11,13 +11,18 @@ import {
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 
 import * as SunCalc from 'suncalc';
-import DigestClient from 'digest-fetch';
-
-type AuthType = 'digest' | 'basic' | 'none';
+import { AuthType, sendCameraRequest, withRetries } from './http';
+import { SerializedPhaseQueue } from './phase-queue';
+import {
+  DayNightPhase,
+  buildSolarEvents,
+  expectedPhaseAt,
+  nextEventForPhase,
+} from './schedule';
 
 const GROUP = 'Day/Night Switcher';
 const GROUP_KEY = 'dayNightSwitcher';
-const MAX_DELAY_MS = 24 * 3600_000;
+const MAX_DELAY_MS = 2_147_483_647;
 
 const mixinsById = new Map<string, DayNightMixin>();
 let mixinsByDevice = new WeakMap<any, DayNightMixin>();
@@ -38,6 +43,8 @@ function normaliseSetting(key: string, value: SettingValue): SettingValue {
     'global.longitude': 'longitude',
     'global.sunriseOffsetMins': 'sunriseOffsetMins',
     'global.sunsetOffsetMins': 'sunsetOffsetMins',
+    'global.retries': 'retries',
+    'global.retryBaseDelayMs': 'retryBaseDelayMs',
   } as Record<string, string>)[key] ?? key;
 
   switch (k) {
@@ -50,6 +57,17 @@ function normaliseSetting(key: string, value: SettingValue): SettingValue {
     case 'sunriseOffsetMins':
     case 'sunsetOffsetMins':
       return isNumLike(value) ? String(clamp(asNumber(value), -720, 720)) : value;
+
+    case 'retries':
+      return isNumLike(value) ? String(Math.round(clamp(asNumber(value), 1, 10))) : value;
+
+    case 'retryBaseDelayMs':
+      return isNumLike(value) ? String(Math.round(clamp(asNumber(value), 0, 60_000))) : value;
+
+    case 'authType': {
+      const authType = String(value ?? 'digest').trim().toLowerCase();
+      return ['digest', 'basic', 'none'].includes(authType) ? authType : 'digest';
+    }
 
     case 'day.url':
     case 'night.url':
@@ -128,6 +146,11 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private rescheduleQueued = false;
   private released = false;
   private scheduleVersion = 0;
+  private initialSyncPending = true;
+
+  // Camera actions are serialized and duplicate requests are coalesced.
+  private phaseSwitchQueue = new SerializedPhaseQueue(phase => this.switchPhase(phase));
+  private lifecycleAbort = new AbortController();
 
   // heartbeat watchdog (interval)
   private heartbeat?: NodeJS.Timeout;
@@ -171,7 +194,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private loadSettingsFromStorage() {
     const keys = [
       'enabled',
-      'overrideLocationAndTime', 'overrideReliability', 'overrideOffsets',
+      'overrideLocationAndTime', 'overrideReliability', 'overrideOffsets', 'overrideSyncOnStartup',
       'sunriseOffsetMins', 'sunsetOffsetMins',
       'latitude', 'longitude', 'timeZone', 'use24h', 'syncOnStartup',
       'retries', 'retryBaseDelayMs', 'logResponses',
@@ -179,7 +202,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       'day.url', 'day.method', 'day.contentType', 'day.headers', 'day.body',
       'night.url', 'night.method', 'night.contentType', 'night.headers', 'night.body',
       'preview', 'previewHtml',
-      'lastPhase',
+      'lastPhase', 'lastPhaseAt',
     ];
 
     for (const key of keys) {
@@ -194,6 +217,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       overrideLocationAndTime: 'false',
       overrideReliability: 'false',
       overrideOffsets: 'false',
+      overrideSyncOnStartup: 'false',
       sunriseOffsetMins: '0',
       sunsetOffsetMins: '0',
       use24h: 'true',
@@ -207,6 +231,15 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
     for (const [key, val] of Object.entries(defaults)) {
       if (!this.settingsState.has(key)) this.settingsState.set(key, val);
+    }
+
+    // Preserve the behavior of older versions where the per-camera sync
+    // setting was implicitly coupled to the location/time override.
+    if (this.storage.getItem('overrideSyncOnStartup') == null &&
+        this.getValue('overrideLocationAndTime') === 'true' &&
+        this.storage.getItem('syncOnStartup') != null) {
+      this.settingsState.set('overrideSyncOnStartup', 'true');
+      this.storage.setItem('overrideSyncOnStartup', 'true');
     }
 
     this.console?.log?.('[Day/Night] Settings loaded from storage');
@@ -240,6 +273,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const overrideLoc = this.getValue('overrideLocationAndTime', 'false') === 'true';
     const overrideRel = this.getValue('overrideReliability', 'false') === 'true';
     const overrideOff = this.getValue('overrideOffsets', 'false') === 'true';
+    const overrideSync = this.getValue('overrideSyncOnStartup', 'false') === 'true';
 
     const g = (k: string) => this.getGlobal?.(k);
     const glat = g?.('latitude') ?? '';
@@ -248,6 +282,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const g24h = (g?.('use24h') ?? 'true') === 'true';
     const gSunriseOff = g?.('sunriseOffsetMins') ?? '0';
     const gSunsetOff  = g?.('sunsetOffsetMins') ?? '0';
+    const gSync = (g?.('syncOnStartup') ?? 'true') === 'true';
 
     const settings: Setting[] = [];
 
@@ -271,6 +306,15 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         type: 'html' as const,
         readonly: true,
         value: this.getValue('previewHtml', '<div style="opacity:.7">Click “Preview schedule”.</div>'),
+      },
+      {
+        key: 'last_success',
+        title: 'Last successful action',
+        group: GROUP,
+        subgroup: 'General',
+        type: 'string' as const,
+        readonly: true,
+        value: this.lastSuccessText(),
       },
       {
         key: '__btn_preview',
@@ -361,16 +405,39 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
           value: this.getValue('use24h', 'true') === 'true',
           description: 'Display times in 24-hour format (e.g. 17:30).',
         },
-        {
-          key: 'syncOnStartup',
-          title: 'Sync phase on startup',
-          group: GROUP,
-          subgroup: 'General',
-          type: 'boolean' as const,
-          value: this.getValue('syncOnStartup', 'true') === 'true',
-          description: 'Send Day/Night on startup if the current state does not match the expected phase.',
-        },
       );
+    }
+
+    settings.push({
+      key: 'overrideSyncOnStartup',
+      title: 'Override startup sync for this camera',
+      group: GROUP,
+      subgroup: 'General',
+      type: 'boolean' as const,
+      value: overrideSync,
+      description: 'If off, this camera uses the Global startup sync setting.',
+    });
+
+    if (overrideSync) {
+      settings.push({
+        key: 'syncOnStartup',
+        title: 'Sync phase on startup',
+        group: GROUP,
+        subgroup: 'General',
+        type: 'boolean' as const,
+        value: this.getValue('syncOnStartup', 'true') === 'true',
+        description: 'Send the expected Day/Night action once when this camera mixin starts or switching is enabled.',
+      });
+    } else {
+      settings.push({
+        key: 'sync_hint',
+        title: 'Using global startup sync',
+        group: GROUP,
+        subgroup: 'General',
+        type: 'string' as const,
+        readonly: true,
+        value: gSync ? 'Enabled' : 'Disabled',
+      });
     }
 
     // Offsets (global default with per-camera override)
@@ -474,7 +541,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
           subgroup: 'Reliability & Logging',
           type: 'number' as const,
           value: this.getValue('retries', ''),
-          description: 'Total tries including the first attempt. Set 1 to disable retries.',
+          description: 'Total tries including the first attempt (1–10). Set 1 to disable retries.',
         },
         {
           key: 'retryBaseDelayMs',
@@ -483,7 +550,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
           subgroup: 'Reliability & Logging',
           type: 'number' as const,
           value: this.getValue('retryBaseDelayMs', ''),
-          description: 'Base delay for exponential back-off; jitter is added.',
+          description: 'Base delay for exponential back-off (0–60000 ms); jitter is added.',
         },
         {
           key: 'logResponses',
@@ -500,17 +567,21 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     return settings;
   }
 
+  private settingValueForLog(key: string, value: SettingValue) {
+    if (key === 'password' || key === 'username' || key.endsWith('.headers') || key.endsWith('.body')) {
+      return '[redacted]';
+    }
+    if (key.endsWith('.url')) return value ? '[configured URL]' : '[empty URL]';
+    return `${value} (type: ${typeof value})`;
+  }
+
   async putMixinSetting(key: string, value: SettingValue) {
     if (this.released) return;
-    if (key === 'password') {
-      this.console?.log?.(`[Day/Night] Setting ${key} = ******`);
-    } else {
-      this.console?.log?.(`[Day/Night] Setting ${key} = ${value} (type: ${typeof value})`);
-    }
+    this.console?.log?.(`[Day/Night] Setting ${key} = ${this.settingValueForLog(key, value)}`);
 
     if (key === '__btn_preview') { await this.previewSchedule(); return; }
-    if (key === '__btn_day')     { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Day with switching disabled.'); await this.switchPhase('day'); return; }
-    if (key === '__btn_night')   { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Night with switching disabled.'); await this.switchPhase('night'); return; }
+    if (key === '__btn_day')     { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Day with switching disabled.'); await this.requestPhaseSwitch('day'); return; }
+    if (key === '__btn_night')   { if (this.getValue('enabled') !== 'true') this.console?.log?.('[Day/Night] Manual Night with switching disabled.'); await this.requestPhaseSwitch('night'); return; }
 
     value = normaliseSetting(key, value);
 
@@ -526,9 +597,13 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     if (typeof value === 'boolean') storageValue = value ? 'true' : 'false';
     this.saveToStorage(key, storageValue);
 
+    if ((key === 'enabled' || key === 'syncOnStartup') && storageValue === 'true') {
+      this.initialSyncPending = true;
+    }
+
     if ([
       'enabled',
-      'overrideLocationAndTime', 'overrideReliability', 'overrideOffsets',
+      'overrideLocationAndTime', 'overrideReliability', 'overrideOffsets', 'overrideSyncOnStartup',
       'latitude', 'longitude', 'timeZone', 'use24h', 'syncOnStartup',
       'sunriseOffsetMins', 'sunsetOffsetMins',
       'retries', 'retryBaseDelayMs', 'logResponses',
@@ -576,10 +651,11 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private static readonly MAX_LOG_BYTES = 64 * 1024; // 64KB safety cap
 
   private logBodyChunks(
-    phase: 'day' | 'night',
+    phase: DayNightPhase,
     statusLine: string,
     body: string,
     contentType?: string,
+    truncated = false,
     chunk = 800,
   ) {
     // Skip obviously non-text payloads
@@ -590,20 +666,13 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       return;
     }
 
-    let logged = 0;
-    const total = body.length;
-    const cap = Math.min(total, DayNightMixin.MAX_LOG_BYTES);
+    const total = Buffer.byteLength(body);
 
-    this.console?.log?.(`[Day/Night] ${phase} response: ${statusLine}; content-type=${contentType || '(unknown)'}; body length=${total}${total > cap ? ` (logging first ${cap} bytes)` : ''}`);
+    this.console?.log?.(`[Day/Night] ${phase} response: ${statusLine}; content-type=${contentType || '(unknown)'}; logged body bytes=${total}${truncated ? ' (truncated)' : ''}`);
 
-    for (let i = 0; i < cap; i += chunk) {
-      const part = body.slice(i, Math.min(i + chunk, cap));
-      this.console?.log?.(`[Day/Night] body[${i}-${Math.min(i + chunk, cap)}]: ${part}`);
-      logged += part.length;
-    }
-
-    if (cap < total) {
-      this.console?.log?.(`[Day/Night] body truncated: logged ${logged}/${total} bytes`);
+    for (let i = 0; i < body.length; i += chunk) {
+      const part = body.slice(i, Math.min(i + chunk, body.length));
+      this.console?.log?.(`[Day/Night] body[${i}-${Math.min(i + chunk, body.length)}]: ${part}`);
     }
   }
 
@@ -617,6 +686,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
   private formatSigned(n: number) {
     return n >= 0 ? `+${n}` : `${n}`;
+  }
+
+  private lastSuccessText() {
+    const phase = this.getString('lastPhase');
+    const timestamp = this.getString('lastPhaseAt');
+    const at = timestamp ? this.safeTime(new Date(timestamp)) : undefined;
+    if (!phase || !at) return 'No successful action recorded yet';
+    return `${phase === 'day' ? 'Day' : 'Night'} at ${this.formatLocal(at)}`;
   }
 
   private actionSettings(which: 'day' | 'night', label: string): Setting[] {
@@ -694,12 +771,13 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const overrideLoc = this.getBool('overrideLocationAndTime', false);
     const overrideRel = this.getBool('overrideReliability', false);
     const overrideOff = this.getBool('overrideOffsets', false);
+    const overrideSync = this.getBool('overrideSyncOnStartup', false);
 
     const latitude  = overrideLoc ? this.n('latitude')  : gNum('latitude');
     const longitude = overrideLoc ? this.n('longitude') : gNum('longitude');
     const timeZone  = overrideLoc ? this.getString('timeZone') : (g('timeZone') || undefined);
     const use24h    = overrideLoc ? this.getBool('use24h', true) : gBool('use24h', true);
-    const syncOnStartup = overrideLoc ? this.getBool('syncOnStartup', true) : gBool('syncOnStartup', true);
+    const syncOnStartup = overrideSync ? this.getBool('syncOnStartup', true) : gBool('syncOnStartup', true);
 
     const sunriseOffsetMins = (overrideOff ? this.n('sunriseOffsetMins') : gNum('sunriseOffsetMins')) ?? 0;
     const sunsetOffsetMins  = (overrideOff ? this.n('sunsetOffsetMins')  : gNum('sunsetOffsetMins'))  ?? 0;
@@ -732,8 +810,8 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         body: this.getString('night.body'),
       },
 
-      retries: retries ?? 1,
-      retryBaseDelayMs: retryBaseDelayMs ?? 0,
+      retries: Math.round(Math.min(10, Math.max(1, retries ?? 1))),
+      retryBaseDelayMs: Math.round(Math.min(60_000, Math.max(0, retryBaseDelayMs ?? 0))),
       logResponses,
       preview: this.getString('preview'),
     };
@@ -808,51 +886,33 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         return;
       }
 
-      const todayTimesRaw = getSunTimesCached(now, c.latitude!, c.longitude!);
-      const sunriseTodayRaw = this.safeTime(todayTimesRaw.sunrise);
-      const sunsetTodayRaw  = this.safeTime(todayTimesRaw.sunset);
+      const events = this.getSolarEventsAround(
+        now,
+        c.latitude!,
+        c.longitude!,
+        c.sunriseOffsetMins,
+        c.sunsetOffsetMins,
+      );
+      const nextSunriseEvent = nextEventForPhase(events, 'day', now);
+      const nextSunsetEvent = nextEventForPhase(events, 'night', now);
+      const expectedPhase = expectedPhaseAt(events, now);
 
-      if (!sunriseTodayRaw || !sunsetTodayRaw) {
-        this.console?.warn?.('[Day/Night] No sunrise/sunset for this date at the configured location.');
-        this.saveToStorage('preview', 'No sunrise/sunset today at this location');
-        this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset at this location today.</div>');
+      if (!nextSunriseEvent || !nextSunsetEvent || !expectedPhase) {
+        this.console?.warn?.('[Day/Night] No usable sunrise/sunset events around this date at the configured location.');
+        this.saveToStorage('preview', 'No sunrise/sunset events near this date');
+        this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset events near this date at this location.</div>');
         return;
       }
 
-      const todaySunrise = this.applyOffset(sunriseTodayRaw, c.sunriseOffsetMins);
-      const todaySunset  = this.applyOffset(sunsetTodayRaw,  c.sunsetOffsetMins);
-
-      const tomorrow = new Date(now);
-      tomorrow.setDate(now.getDate() + 1);
-      const tomorrowTimesRaw = getSunTimesCached(tomorrow, c.latitude!, c.longitude!);
-      const sunriseTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunrise);
-      const sunsetTomorrowRaw  = this.safeTime(tomorrowTimesRaw.sunset);
-
-      const nextSunrise = (todaySunrise.getTime() > now.getTime() ? todaySunrise :
-                          (sunriseTomorrowRaw ? this.applyOffset(sunriseTomorrowRaw, c.sunriseOffsetMins) : todaySunrise));
-      const nextSunset  = (todaySunset.getTime() > now.getTime() ? todaySunset :
-                          (sunsetTomorrowRaw ? this.applyOffset(sunsetTomorrowRaw, c.sunsetOffsetMins) : todaySunset));
+      const nextSunrise = nextSunriseEvent.at;
+      const nextSunset = nextSunsetEvent.at;
 
       this.scheduleAt(nextSunrise, () => {
-        this.switchPhase('day');
-        // gated 60s follow-up reschedule
-        const v = this.scheduleVersion;
-        const t = setTimeout(() => {
-          if (this.released || v !== this.scheduleVersion) return;
-          this.rescheduleAll();
-        }, 60_000);
-        this.timers.push(t);
+        this.runScheduledPhase('day');
       });
 
       this.scheduleAt(nextSunset, () => {
-        this.switchPhase('night');
-        // gated 60s follow-up reschedule
-        const v = this.scheduleVersion;
-        const t = setTimeout(() => {
-          if (this.released || v !== this.scheduleVersion) return;
-          this.rescheduleAll();
-        }, 60_000);
-        this.timers.push(t);
+        this.runScheduledPhase('night');
       });
 
       const preview = `Sunrise → Day: ${this.formatLocal(nextSunrise)} | Sunset → Night: ${this.formatLocal(nextSunset)}`;
@@ -872,8 +932,15 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
       this.console?.log?.(`[Day/Night] Scheduled: ${preview}`);
 
-      if (c.syncOnStartup) {
-        this.checkCurrentPhase(now, sunriseTodayRaw, sunsetTodayRaw, c.sunriseOffsetMins, c.sunsetOffsetMins);
+      if (!c.syncOnStartup) {
+        this.initialSyncPending = false;
+      } else if (this.initialSyncPending) {
+        this.console?.log?.(`[Day/Night] Initial phase sync: ${expectedPhase}`);
+        this.requestPhaseSwitch(expectedPhase).then(() => {
+          this.initialSyncPending = false;
+        }).catch(e => {
+          this.console?.error?.(`[Day/Night] Initial ${expectedPhase} sync failed; will retry on the next schedule check:`, e?.message || e);
+        });
       }
     } finally {
       this.isRescheduling = false;
@@ -886,35 +953,39 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
   }
 
-  private checkCurrentPhase(now: Date, sunriseRaw: Date, sunsetRaw: Date, sunriseOffset: number, sunsetOffset: number) {
-    const actualSunrise = new Date(sunriseRaw.getTime() + (sunriseOffset || 0) * 60000);
-    const actualSunset  = new Date(sunsetRaw.getTime()  + (sunsetOffset  || 0) * 60000);
-    const currentTime = now.getTime();
+  private getSolarEventsAround(
+    now: Date,
+    latitude: number,
+    longitude: number,
+    sunriseOffsetMins: number,
+    sunsetOffsetMins: number,
+  ) {
+    const days: SunTimes[] = [];
 
-    const expectedPhase: 'day' | 'night' =
-      (currentTime >= actualSunrise.getTime() && currentTime < actualSunset.getTime()) ? 'day' : 'night';
-
-    const lastPhase = this.getValue('lastPhase');
-
-    this.console?.log?.(`[Day/Night] Phase check at ${this.formatLocal(now)}:`);
-    this.console?.log?.(`  - Sunrise (raw): ${this.formatLocal(sunriseRaw)}  | offset: ${sunriseOffset} min  → actual: ${this.formatLocal(actualSunrise)}`);
-    this.console?.log?.(`  - Sunset  (raw): ${this.formatLocal(sunsetRaw)}   | offset: ${sunsetOffset} min  → actual: ${this.formatLocal(actualSunset)}`);
-    this.console?.log?.(`  - Expected phase: ${expectedPhase}`);
-    this.console?.log?.(`  - Last phase: ${lastPhase || 'unknown'}`);
-
-    if (lastPhase !== expectedPhase) {
-      this.console?.log?.(`[Day/Night] Switching to ${expectedPhase} mode now`);
-      this.switchPhase(expectedPhase).catch(e => {
-        this.console?.error?.(`[Day/Night] Failed to switch to ${expectedPhase}:`, e);
-      });
-    } else {
-      this.console?.debug?.(`[Day/Night] Already in ${expectedPhase} mode`);
+    // Yesterday is needed for determining the current phase with positive
+    // offsets; two days ahead is needed for the next event with negative ones.
+    for (let dayOffset = -1; dayOffset <= 2; dayOffset++) {
+      const date = new Date(now);
+      date.setDate(now.getDate() + dayOffset);
+      const raw = getSunTimesCached(date, latitude, longitude);
+      const sunrise = this.safeTime(raw.sunrise);
+      const sunset = this.safeTime(raw.sunset);
+      if (sunrise && sunset) days.push({ sunrise, sunset });
     }
+
+    return buildSolarEvents(days, sunriseOffsetMins, sunsetOffsetMins);
   }
 
-  private applyOffset(dt: Date, mins?: number) {
-    const offsetMs = (mins || 0) * 60000;
-    return new Date(dt.getTime() + offsetMs);
+  private runScheduledPhase(phase: DayNightPhase) {
+    const version = this.scheduleVersion;
+    this.requestPhaseSwitch(phase).catch(e => {
+      this.console?.error?.(`[Day/Night] Scheduled ${phase} switch failed:`, e?.message || e);
+    }).finally(() => {
+      if (this.released || version !== this.scheduleVersion) return;
+      this.rescheduleAll().catch(e =>
+        this.console?.error?.('[Day/Night] Post-action reschedule failed:', e)
+      );
+    });
   }
 
   private scheduleAt(when: Date, fn: () => void, label: 'action' | 'recalc' = 'action') {
@@ -939,42 +1010,22 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
   }
 
-  private async switchPhase(phase: 'day' | 'night') {
+  private requestPhaseSwitch(phase: DayNightPhase): Promise<void> {
+    if (this.released) return Promise.reject(new Error('Mixin has been released'));
+    return this.phaseSwitchQueue.request(phase);
+  }
+
+  private async switchPhase(phase: DayNightPhase) {
     try {
       this.console?.log?.(`[Day/Night] Switching to ${phase} mode...`);
       await this.invokeAction(phase);
       this.saveToStorage('lastPhase', phase);
+      this.saveToStorage('lastPhaseAt', new Date().toISOString());
       this.console?.log?.(`[Day/Night] Successfully switched to ${phase} mode`);
     } catch (e: any) {
       this.console?.error?.(`[Day/Night] Failed to switch to ${phase} mode:`, e?.message || e);
+      throw e;
     }
-  }
-
-  private async doWithRetries<T>(
-    fn: () => Promise<T>,
-    attempts?: number,
-    baseDelayMs?: number
-  ): Promise<T> {
-    let lastErr: any;
-    const tries = Math.max(1, attempts || 1);
-    const base = Math.max(0, baseDelayMs || 0);
-
-    for (let i = 0; i < tries; i++) {
-      try {
-        return await fn();
-      } catch (e) {
-        lastErr = e;
-        if (i < tries - 1) {
-          const jitter = Math.floor(Math.random() * 250);
-          const delay = base * Math.pow(2, i) + jitter;
-          if (delay > 0) {
-            this.console?.log?.(`[Day/Night] Retry ${i + 1}/${tries} after ${delay}ms delay`);
-            await new Promise(r => setTimeout(r, delay));
-          }
-        }
-      }
-    }
-    throw lastErr;
   }
 
   private normaliseAndMergeHeaders(target: Record<string, string>, json?: string) {
@@ -1003,32 +1054,64 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
   }
 
-  private async fetchWithTimeout(input: any, init: any, ms = 10000): Promise<Response> {
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), ms);
+  private async discardResponseBody(response: Response | import('node-fetch').Response) {
+    const body: any = response.body;
+    if (!body) return;
     try {
-      return await fetch(input, { ...init, signal: ac.signal } as any);
-    } finally {
-      clearTimeout(t);
-    }
+      if (typeof body.cancel === 'function') await body.cancel();
+      else if (typeof body.destroy === 'function') body.destroy();
+    } catch {}
   }
 
-  private async digestFetchWithTimeout(
-    client: DigestClient,
-    url: string,
-    init: any,
-    ms = 10_000,
-  ): Promise<Response> {
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), ms);
-    try {
-      return await client.fetch(url, { ...init, signal: ac.signal } as any);
-    } finally {
-      clearTimeout(t);
+  private async readResponseBodyLimited(
+    response: Response | import('node-fetch').Response,
+    limit = DayNightMixin.MAX_LOG_BYTES,
+  ): Promise<{ text: string; truncated: boolean }> {
+    const body: any = response.body;
+    if (!body) return { text: '', truncated: false };
+
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let truncated = false;
+
+    for await (const rawChunk of body as AsyncIterable<Uint8Array | string>) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      const remaining = limit - bytes;
+      if (chunk.length > remaining) {
+        if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+        bytes = limit;
+        truncated = true;
+        await this.discardResponseBody(response);
+        break;
+      }
+      chunks.push(chunk);
+      bytes += chunk.length;
     }
+
+    return { text: Buffer.concat(chunks, bytes).toString('utf8'), truncated };
   }
 
-  private async invokeAction(phase: 'day' | 'night') {
+  private async handleResponse(
+    phase: DayNightPhase,
+    response: Response | import('node-fetch').Response,
+    logResponses: boolean,
+  ) {
+    const statusLine = `HTTP ${response.status} ${response.statusText}`;
+    const contentType = response.headers.get('content-type') || undefined;
+    const isTextish = /^(text\/|application\/(json|xml|x-www-form-urlencoded))/.test((contentType || '').toLowerCase()) || !contentType;
+
+    if (logResponses && isTextish) {
+      const body = await this.readResponseBodyLimited(response);
+      this.logBodyChunks(phase, statusLine, body.text, contentType, body.truncated);
+    } else {
+      if (logResponses) this.logBodyChunks(phase, statusLine, '', contentType);
+      await this.discardResponseBody(response);
+    }
+
+    if (!response.ok) throw new Error(statusLine);
+  }
+
+  private async invokeAction(phase: DayNightPhase) {
     const c = this.readConfig();
     const action = (phase === 'day' ? c.day : c.night) || {};
 
@@ -1041,42 +1124,26 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     if (action.contentType && bodyAllowed) headers['Content-Type'] = action.contentType;
     this.normaliseAndMergeHeaders(headers, action.headers);
 
-    await this.doWithRetries(async () => {
-      if (c.authType === 'digest') {
-        const client = new DigestClient(c.username || '', c.password || '');
-        const init: any = { method, headers };
-        if (bodyAllowed && action.body) init.body = action.body;
-        const response = await this.digestFetchWithTimeout(client, action.url!, init, 10_000);
-        const responseText = await response.text().catch(() => '');
-        const statusLine = `HTTP ${response.status} ${response.statusText}`;
-        const ct = response.headers.get('content-type') || undefined;
-        if (c.logResponses) {
-          this.logBodyChunks(phase, statusLine, responseText, ct);
-        }
-        if (!response.ok) {
-          throw new Error(statusLine);
-        }
-        return;
-      } else {
-        const fetchHeaders = { ...headers };
-        if (c.authType === 'basic' && c.username && c.password) {
-          const token = Buffer.from(`${c.username}:${c.password}`).toString('base64');
-          fetchHeaders['Authorization'] = `Basic ${token}`;
-        }
-        const init: any = { method, headers: fetchHeaders };
-        if (bodyAllowed && action.body) init.body = action.body;
-        const response = await this.fetchWithTimeout(action.url!, init, 10000);
-        const responseText = await response.text().catch(() => '');
-        const statusLine = `HTTP ${response.status} ${response.statusText}`;
-        const ct = response.headers.get('content-type') || undefined;
-        if (c.logResponses) {
-          this.logBodyChunks(phase, statusLine, responseText, ct);
-        }
-        if (!response.ok) {
-          throw new Error(statusLine);
-        }
-      }
-    }, c.retries, c.retryBaseDelayMs);
+    await withRetries(async () => {
+      const response = await sendCameraRequest({
+        url: action.url!,
+        method,
+        headers,
+        body: bodyAllowed && action.body ? action.body : undefined,
+        authType: c.authType,
+        username: c.username,
+        password: c.password,
+        lifecycleSignal: this.lifecycleAbort.signal,
+      });
+      await this.handleResponse(phase, response, c.logResponses);
+    }, {
+      attempts: c.retries,
+      baseDelayMs: c.retryBaseDelayMs,
+      signal: this.lifecycleAbort.signal,
+      onRetry: (attempt, totalAttempts, delayMs) => {
+        this.console?.log?.(`[Day/Night] Retry ${attempt}/${totalAttempts} after ${delayMs}ms delay`);
+      },
+    });
   }
 
   private safeTimeZone(tz?: string): string | undefined {
@@ -1135,6 +1202,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const nextWhen  = nextIsSunrise ? nextSunrise : nextSunset;
     const nextPhase = nextIsSunrise ? 'Day' : 'Night';
     const tz = tzLabel ? ` (${tzLabel})` : '';
+    const lastSuccess = this.lastSuccessText();
     const ICON_GAP_PX = 8;
 
     const icoHeader = (e: string) =>
@@ -1162,6 +1230,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         at <b>${this.formatLocal(nextWhen)}</b>${tz}
         <span style="opacity:.7">(${this.formatRelativeShort(nextWhen, now)})</span>
       </div>
+      <div style="margin:0 0 10px">
+        <strong>Last successful action:</strong> ${lastSuccess}
+      </div>
       <table style="border-collapse:collapse;margin:0;table-layout:fixed;width:100%">
         <tbody>${rows}</tbody>
       </table>
@@ -1185,30 +1256,20 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
     const now = new Date();
 
-    const todayTimesRaw = getSunTimesCached(now, c.latitude!, c.longitude!);
-    const sunriseTodayRaw = this.safeTime(todayTimesRaw.sunrise);
-    const sunsetTodayRaw  = this.safeTime(todayTimesRaw.sunset);
-    if (!sunriseTodayRaw || !sunsetTodayRaw) {
-      this.saveToStorage('preview', 'No sunrise/sunset today at this location');
-      this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset at this location today.</div>');
+    const events = this.getSolarEventsAround(
+      now,
+      c.latitude!,
+      c.longitude!,
+      c.sunriseOffsetMins,
+      c.sunsetOffsetMins,
+    );
+    const nextSunrise = nextEventForPhase(events, 'day', now)?.at;
+    const nextSunset = nextEventForPhase(events, 'night', now)?.at;
+    if (!nextSunrise || !nextSunset) {
+      this.saveToStorage('preview', 'No sunrise/sunset events near this date');
+      this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset events near this date at this location.</div>');
       return;
     }
-
-    const todaySunrise = this.applyOffset(sunriseTodayRaw, c.sunriseOffsetMins);
-    const todaySunset  = this.applyOffset(sunsetTodayRaw,  c.sunsetOffsetMins);
-
-    const tomorrow = new Date(now);
-    tomorrow.setDate(now.getDate() + 1);
-    const tomorrowTimesRaw = getSunTimesCached(tomorrow, c.latitude!, c.longitude!);
-    const sunriseTomorrowRaw = this.safeTime(tomorrowTimesRaw.sunrise);
-    const sunsetTomorrowRaw  = this.safeTime(tomorrowTimesRaw.sunset);
-
-    const nextSunrise = todaySunrise.getTime() > now.getTime()
-      ? todaySunrise
-      : (sunriseTomorrowRaw ? this.applyOffset(sunriseTomorrowRaw, c.sunriseOffsetMins) : todaySunrise);
-    const nextSunset = todaySunset.getTime() > now.getTime()
-      ? todaySunset
-      : (sunsetTomorrowRaw ? this.applyOffset(sunsetTomorrowRaw, c.sunsetOffsetMins) : todaySunset);
 
     const text = `Sunrise → Day: ${this.formatLocal(nextSunrise)} | Sunset → Night: ${this.formatLocal(nextSunset)}`;
     this.saveToStorage('preview', text);
@@ -1228,6 +1289,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
   async release() {
     this.released = true;
+    this.lifecycleAbort.abort();
+    const releaseError = new Error('Mixin released before the queued phase switch could run');
+    this.phaseSwitchQueue.release(releaseError);
     this.clearTimers();
     this.stopHeartbeat();
     if (this.globalsDebounce) {
@@ -1291,6 +1355,7 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
         title: 'Sync phase on startup',
         type: 'boolean' as const,
         value: get('global.syncOnStartup', 'true') === 'true',
+        description: 'Send the expected Day/Night action once when each camera mixin starts or switching is enabled.',
       },
 
       { key: 'global.sunriseOffsetMins',
@@ -1317,7 +1382,7 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
         type: 'number' as const,
         value: get('global.retries', '1'),
         placeholder: '1',
-        description: 'Total tries per request. Set 1 to disable retries.',
+        description: 'Total tries per request (1–10). Set 1 to disable retries.',
       },
       {
         key: 'global.retryBaseDelayMs',
@@ -1325,7 +1390,7 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
         type: 'number' as const,
         value: get('global.retryBaseDelayMs', '0'),
         placeholder: '500',
-        description: 'Base delay for exponential back-off with jitter.',
+        description: 'Base delay for exponential back-off (0–60000 ms) with jitter.',
       },
       {
         key: 'global.logResponses',
@@ -1363,7 +1428,9 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
     try {
       deviceId = mixinDeviceState?.id;
       if (!deviceId && typeof mixinDevice?.id === 'function') deviceId = await mixinDevice.id();
+      if (!deviceId && typeof mixinDevice?.id === 'string') deviceId = mixinDevice.id;
       if (!deviceId && typeof mixinDevice?.nativeId === 'function') deviceId = await mixinDevice.nativeId();
+      if (!deviceId && typeof mixinDevice?.nativeId === 'string') deviceId = mixinDevice.nativeId;
     } catch (e) {
       this.console?.error?.('[Day/Night] Error getting device ID:', e);
     }
@@ -1402,13 +1469,14 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
   }
 
   async releaseMixin(id: string, mixinDevice: any): Promise<void> {
-    const inst = mixinsByDevice.get(mixinDevice);
+    const inst = mixinsByDevice.get(mixinDevice) ?? mixinsById.get(String(id));
     if (!inst) {
       return;
     }
     mixinsByDevice.delete(mixinDevice);
-    const key = String(id);
-    if (mixinsById.get(key) === inst) mixinsById.delete(key);
+    for (const [key, candidate] of mixinsById) {
+      if (candidate === inst) mixinsById.delete(key);
+    }
     try { await inst.release(); } catch (e) {
       this.console?.warn?.('[Day/Night] Error during mixin release:', (e as any)?.message ?? e);
     }
