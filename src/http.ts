@@ -36,6 +36,34 @@ export class CameraResponseConsumerError extends Error {
   }
 }
 
+export class CameraHttpStatusError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+
+  constructor(status: number, statusText: string) {
+    super(`HTTP ${status} ${statusText}`.trim());
+    this.name = 'CameraHttpStatusError';
+    this.status = status;
+    this.statusText = statusText;
+  }
+}
+
+export function isRetryableHttpStatus(status: number) {
+  return status === 408
+    || status === 429
+    || (status >= 500 && status <= 599);
+}
+
+export function isRetryableCameraError(error: unknown) {
+  if (error instanceof CameraHttpStatusError) {
+    return isRetryableHttpStatus(error.status);
+  }
+
+  // Fetch failures and request timeouts are transient unless the action's
+  // lifecycle signal was cancelled, which withRetries handles separately.
+  return true;
+}
+
 export async function withRetries<T>(
   work: () => Promise<T>,
   options: {
@@ -44,6 +72,7 @@ export async function withRetries<T>(
     signal?: AbortSignal;
     random?: () => number;
     wait?: (ms: number, signal?: AbortSignal) => Promise<void>;
+    shouldRetry?: (error: unknown) => boolean;
     onRetry?: (attempt: number, totalAttempts: number, delayMs: number) => void;
   } = {},
 ): Promise<T> {
@@ -61,6 +90,7 @@ export async function withRetries<T>(
     } catch (error) {
       lastError = error;
       if (options.signal?.aborted) throw error;
+      if (options.shouldRetry && !options.shouldRetry(error)) throw error;
       if (index >= attempts - 1) break;
 
       const jitter = Math.floor(random() * 250);

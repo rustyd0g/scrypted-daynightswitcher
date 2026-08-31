@@ -13,7 +13,9 @@ import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/s
 import * as SunCalc from 'suncalc';
 import {
   AuthType,
+  CameraHttpStatusError,
   CameraResponseConsumerError,
+  isRetryableCameraError,
   sendCameraRequest,
   withRetries,
 } from './http';
@@ -1310,7 +1312,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       await this.discardResponseBody(response);
     }
 
-    if (!response.ok) throw new Error(statusLine);
+    if (!response.ok) {
+      throw new CameraHttpStatusError(response.status, response.statusText);
+    }
   }
 
   private async invokeAction(phase: DayNightPhase, actionSignal?: AbortSignal) {
@@ -1357,9 +1361,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
               return;
             }
             if (!error.response.ok) {
-              throw new Error(
-                `HTTP ${error.response.status} ${error.response.statusText}`,
-                { cause: error.cause },
+              throw new CameraHttpStatusError(
+                error.response.status,
+                error.response.statusText,
               );
             }
             throw error.cause;
@@ -1370,6 +1374,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         attempts: c.retries,
         baseDelayMs: c.retryBaseDelayMs,
         signal: linkedAbort.signal,
+        shouldRetry: isRetryableCameraError,
         onRetry: (attempt, totalAttempts, delayMs) => {
           this.console?.log?.(`[Day/Night] Retry ${attempt}/${totalAttempts} after ${delayMs}ms delay`);
         },

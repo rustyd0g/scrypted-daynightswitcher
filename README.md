@@ -55,6 +55,7 @@ You will also need the correct **HTTP endpoints** for your model and firmware:
   * **HTTP total attempts:** Total tries including the first attempt. `1` disables retries; the maximum is `10`.
   * **Retry base delay (ms):** Base delay between retries. The maximum is `60000` ms.
   * **Log HTTP responses:** Log the status and a capped response body.
+  * Retries apply to network errors, timeouts, HTTP `408`, HTTP `429`, and HTTP `5xx` responses. Other HTTP `4xx` responses fail immediately.
 
 ## Per-camera settings
 

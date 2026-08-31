@@ -3,7 +3,10 @@ import { test } from 'node:test';
 
 import {
   abortableDelay,
+  CameraHttpStatusError,
   CameraResponseConsumerError,
+  isRetryableCameraError,
+  isRetryableHttpStatus,
   sendCameraRequest,
   withRetries,
 } from '../src/http.ts';
@@ -102,6 +105,61 @@ test('retries with exponential backoff and deterministic jitter', async () => {
   assert.equal(result, 'success');
   assert.equal(calls, 3);
   assert.deepEqual(delays, [100, 200]);
+});
+
+test('classifies transient and permanent HTTP statuses', () => {
+  for (const status of [408, 429, 500, 502, 503, 599]) {
+    assert.equal(isRetryableHttpStatus(status), true, `${status} should be retryable`);
+    assert.equal(
+      isRetryableCameraError(new CameraHttpStatusError(status, 'transient')),
+      true,
+    );
+  }
+
+  for (const status of [400, 401, 403, 404, 409, 422, 499]) {
+    assert.equal(isRetryableHttpStatus(status), false, `${status} should not be retryable`);
+    assert.equal(
+      isRetryableCameraError(new CameraHttpStatusError(status, 'permanent')),
+      false,
+    );
+  }
+
+  assert.equal(isRetryableCameraError(new Error('network failure')), true);
+});
+
+test('stops immediately when retry classification rejects an error', async () => {
+  let calls = 0;
+  let retryNotifications = 0;
+
+  await assert.rejects(withRetries(async () => {
+    calls++;
+    throw new CameraHttpStatusError(401, 'Unauthorized');
+  }, {
+    attempts: 4,
+    shouldRetry: isRetryableCameraError,
+    onRetry: () => retryNotifications++,
+  }), error => error instanceof CameraHttpStatusError && error.status === 401);
+
+  assert.equal(calls, 1);
+  assert.equal(retryNotifications, 0);
+});
+
+test('retries a transient HTTP status using the configured attempt count', async () => {
+  let calls = 0;
+
+  const result = await withRetries(async () => {
+    calls++;
+    if (calls < 3) throw new CameraHttpStatusError(503, 'Service Unavailable');
+    return 'success';
+  }, {
+    attempts: 3,
+    shouldRetry: isRetryableCameraError,
+    random: () => 0,
+    wait: async () => {},
+  });
+
+  assert.equal(result, 'success');
+  assert.equal(calls, 3);
 });
 
 test('aborts a pending retry delay during lifecycle cleanup', async () => {

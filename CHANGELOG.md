@@ -9,6 +9,7 @@
 * Added missed-transition detection and cancellation of obsolete automatic actions.
 * Corrected solar event history for large offsets and stabilised SunCalc date lookups around midnight.
 * Added request timeouts, bounded retries, lifecycle cancellation, safer response handling, and redacted configuration logging.
+* Limited automatic request retries to network errors, timeouts, HTTP 408, HTTP 429, and HTTP 5xx responses.
 * Extended request timeouts through response consumption without allowing diagnostic logging failures to repeat successful actions.
 * Added the last successful action and timestamp to the schedule preview.
 * Added scheduler, HTTP authentication, retry, timeout, queue, migration, reconciliation, and cleanup tests.
