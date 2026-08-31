@@ -5,6 +5,7 @@ import {
   buildSolarEvents,
   expectedPhaseAt,
   nextEventForPhase,
+  solarEventDayOffsets,
 } from '../src/schedule.ts';
 
 const at = (iso: string) => new Date(iso);
@@ -59,4 +60,71 @@ test('ignores invalid solar dates returned for polar locations', () => {
   assert.deepEqual(events, []);
   assert.equal(expectedPhaseAt(events, at('2026-01-01T12:00:00.000Z')), undefined);
   assert.equal(nextEventForPhase(events, 'day', at('2026-01-01T12:00:00.000Z')), undefined);
+});
+
+test('extends the input-day horizon when offsets can cross a calendar boundary', () => {
+  assert.deepEqual(solarEventDayOffsets(0, 0), [-2, -1, 0, 1, 2]);
+  assert.deepEqual(solarEventDayOffsets(0, 420), [-3, -2, -1, 0, 1, 2]);
+  assert.deepEqual(solarEventDayOffsets(-720, 0), [-2, -1, 0, 1, 2, 3]);
+  assert.deepEqual(solarEventDayOffsets(1441, -1441), [-4, -3, -2, -1, 0, 1, 2, 3, 4]);
+});
+
+test('includes the prior adjusted sunset at high latitude with a positive offset', () => {
+  // SunCalc results for -54.8, -68.3 around 2026-01-01. At this latitude,
+  // sunset falls on the following UTC date before the configured offset.
+  const now = at('2026-01-01T05:00:00.000Z');
+  const solarTimes = new Map<number, ReturnType<typeof day>>([
+    [-2, {
+      sunrise: at('2025-12-30T07:59:43.911Z'),
+      sunset: at('2025-12-31T01:14:11.799Z'),
+    }],
+    [-1, {
+      sunrise: at('2025-12-31T08:00:49.123Z'),
+      sunset: at('2026-01-01T01:14:02.510Z'),
+    }],
+    [0, {
+      sunrise: at('2026-01-01T08:01:57.966Z'),
+      sunset: at('2026-01-02T01:13:49.100Z'),
+    }],
+    [1, {
+      sunrise: at('2026-01-02T08:03:10.348Z'),
+      sunset: at('2026-01-03T01:13:31.604Z'),
+    }],
+    [2, {
+      sunrise: at('2026-01-03T08:04:26.177Z'),
+      sunset: at('2026-01-04T01:13:10.059Z'),
+    }],
+  ]);
+  const days = solarEventDayOffsets(0, 420)
+    .map(offset => solarTimes.get(offset))
+    .filter((times): times is ReturnType<typeof day> => !!times);
+  const incompleteDays = [-1, 0, 1, 2]
+    .map(offset => solarTimes.get(offset))
+    .filter((times): times is ReturnType<typeof day> => !!times);
+
+  const events = buildSolarEvents(days, 0, 420);
+
+  assert.equal(expectedPhaseAt(buildSolarEvents(incompleteDays, 0, 420), now), 'day');
+  assert.equal(expectedPhaseAt(events, now), 'night');
+});
+
+test('includes the prior sunset near the international date line', () => {
+  const now = at('2026-01-01T00:05:00.000Z');
+  const days = [
+    {
+      sunrise: at('2025-12-30T17:56:17.086Z'),
+      sunset: at('2025-12-31T06:03:31.869Z'),
+    },
+    {
+      sunrise: at('2025-12-31T17:56:45.094Z'),
+      sunset: at('2026-01-01T06:03:59.640Z'),
+    },
+    {
+      sunrise: at('2026-01-01T17:57:12.860Z'),
+      sunset: at('2026-01-02T06:04:27.144Z'),
+    },
+  ];
+
+  assert.equal(expectedPhaseAt(buildSolarEvents(days.slice(1), -720, 0), now), 'day');
+  assert.equal(expectedPhaseAt(buildSolarEvents(days, -720, 0), now), 'night');
 });

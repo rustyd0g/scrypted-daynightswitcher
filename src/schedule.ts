@@ -10,6 +10,32 @@ export interface SolarEvent {
   phase: DayNightPhase;
 }
 
+const MINUTES_PER_DAY = 24 * 60;
+
+/**
+ * Return the input-day offsets needed to determine the current phase and the
+ * next sunrise and sunset. The baseline accounts for solar events falling on
+ * an adjacent UTC day. An adjusted event can cross another calendar-day
+ * boundary, so extend the corresponding side for positive or negative
+ * offsets.
+ */
+export function solarEventDayOffsets(
+  sunriseOffsetMins: number,
+  sunsetOffsetMins: number,
+): number[] {
+  const offsets = [sunriseOffsetMins, sunsetOffsetMins]
+    .filter(Number.isFinite);
+  const largestPositiveOffset = Math.max(0, ...offsets);
+  const largestNegativeOffset = Math.min(0, ...offsets);
+  const firstDay = -2 - Math.ceil(largestPositiveOffset / MINUTES_PER_DAY);
+  const lastDay = 2 + Math.ceil(Math.abs(largestNegativeOffset) / MINUTES_PER_DAY);
+
+  return Array.from(
+    { length: lastDay - firstDay + 1 },
+    (_, index) => firstDay + index,
+  );
+}
+
 export function buildSolarEvents(
   days: SunTimesForDay[],
   sunriseOffsetMins: number,

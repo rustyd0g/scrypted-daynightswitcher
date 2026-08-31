@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   abortableDelay,
+  CameraResponseConsumerError,
   sendCameraRequest,
   withRetries,
 } from '../src/http.ts';
@@ -110,6 +111,26 @@ test('aborts a pending retry delay during lifecycle cleanup', async () => {
   await assert.rejects(pending, /aborted/);
 });
 
+test('does not start another retry after the operation is aborted', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  let retryNotifications = 0;
+
+  const pending = withRetries(async () => {
+    calls++;
+    controller.abort();
+    throw new Error('cancelled action');
+  }, {
+    attempts: 3,
+    signal: controller.signal,
+    onRetry: () => retryNotifications++,
+  });
+
+  await assert.rejects(pending, /cancelled action/);
+  assert.equal(calls, 1);
+  assert.equal(retryNotifications, 0);
+});
+
 test('times out an HTTP request that does not respond promptly', async () => {
   await assert.rejects(sendCameraRequest({
     url: 'http://camera.local/slow',
@@ -132,4 +153,79 @@ test('aborts an active HTTP request when the lifecycle signal is cancelled', asy
   }, { fetch: abortingFetch() });
   controller.abort();
   await assert.rejects(pending, error => (error as Error).name === 'AbortError');
+});
+
+test('keeps the request timeout active while consuming the response', async () => {
+  let consumerSignal: AbortSignal | undefined;
+  const response = responseWithText('OK');
+  const requestFetch = (async () => response) as any;
+
+  const pending = sendCameraRequest({
+    url: 'http://camera.local/slow-body',
+    method: 'GET',
+    headers: {},
+    authType: 'none',
+    timeoutMs: 10,
+  }, { fetch: requestFetch }, async (_response, signal) => {
+    consumerSignal = signal;
+    return new Promise<string>(() => {});
+  });
+
+  await assert.rejects(pending, error => {
+    assert.ok(error instanceof CameraResponseConsumerError);
+    assert.equal(error.response, response);
+    assert.equal((error.cause as Error).name, 'AbortError');
+    return true;
+  });
+  assert.equal(consumerSignal?.aborted, true);
+});
+
+test('keeps lifecycle cancellation active while consuming the response', async () => {
+  const controller = new AbortController();
+  let consumerSignal: AbortSignal | undefined;
+  const response = responseWithText('OK');
+  const requestFetch = (async () => response) as any;
+
+  const pending = sendCameraRequest({
+    url: 'http://camera.local/slow-body',
+    method: 'GET',
+    headers: {},
+    authType: 'none',
+    timeoutMs: 1_000,
+    lifecycleSignal: controller.signal,
+  }, { fetch: requestFetch }, async (_response, signal) => {
+    consumerSignal = signal;
+    return new Promise<string>(() => {});
+  });
+
+  controller.abort();
+  await assert.rejects(pending, error => {
+    assert.ok(error instanceof CameraResponseConsumerError);
+    assert.equal(error.response, response);
+    assert.equal((error.cause as Error).name, 'AbortError');
+    return true;
+  });
+  assert.equal(consumerSignal?.aborted, true);
+});
+
+test('preserves the response and cause when response consumption fails', async () => {
+  const response = responseWithText('OK');
+  const readError = new Error('response body failed');
+  const requestFetch = (async () => response) as any;
+
+  const pending = sendCameraRequest({
+    url: 'http://camera.local/broken-body',
+    method: 'GET',
+    headers: {},
+    authType: 'none',
+  }, { fetch: requestFetch }, async () => {
+    throw readError;
+  });
+
+  await assert.rejects(pending, error => {
+    assert.ok(error instanceof CameraResponseConsumerError);
+    assert.equal(error.response, response);
+    assert.equal(error.cause, readError);
+    return true;
+  });
 });

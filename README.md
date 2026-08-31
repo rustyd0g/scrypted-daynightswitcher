@@ -84,7 +84,12 @@ You will also need the correct **HTTP endpoints** for your model and firmware:
 * The plugin maintains two scheduled events: **Sunrise to Day** and **Sunset to Night**.
 * These times are recalculated hourly (with offsets applied).
 * After each event runs, the schedule is refreshed to ensure accuracy.
-* A guard timer re-checks every 3 hours to catch long sleeps or restarts.
+* Hourly checks detect a calculated phase change even if the original transition timer was cleared or delayed.
+* If a scheduled action exhausts its configured attempts, the plugin retries the expected phase during hourly schedule checks until it succeeds or the expected phase changes.
+* Manual action failures do not create a pending reconciliation.
+* Obsolete queued automatic actions are cancelled when switching is disabled or the expected phase changes.
+* A separate guard timer re-checks long-running sessions every 3 hours. Startup initialization handles plugin and server restarts.
+* Pending reconciliation is held in memory. Startup sync normally restores the expected phase after a restart; if startup sync is disabled, an earlier pending retry is not resumed.
 
 ## Configuration examples (tested models)
 
@@ -241,6 +246,7 @@ These values are defined by the compatible CGI API. Availability can vary by mod
 * **401 (Unauthorized):** Check the credentials and authentication type.
 * **404 (Not Found):** Check the endpoint path and parameters.
 * **200 but no change:** The camera's automatic schedule may still be active, or the request parameters may be wrong.
+* **Scheduled action failed:** The configured request attempts run first. If they all fail, hourly reconciliation continues while that phase is still expected.
 * **Network reachability:** Ensure Scrypted can reach the camera.
 
 ### Debugging steps

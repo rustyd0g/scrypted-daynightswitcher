@@ -11,14 +11,29 @@ import {
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 
 import * as SunCalc from 'suncalc';
-import { AuthType, sendCameraRequest, withRetries } from './http';
-import { SerializedPhaseQueue } from './phase-queue';
+import {
+  AuthType,
+  CameraResponseConsumerError,
+  sendCameraRequest,
+  withRetries,
+} from './http';
+import {
+  PhaseQueueCancellationError,
+  PhaseRequestContext,
+  SerializedPhaseQueue,
+} from './phase-queue';
+import {
+  PhaseAutomationCoordinator,
+  ReconciliationDecision,
+} from './reconciliation';
 import {
   DayNightPhase,
   buildSolarEvents,
   expectedPhaseAt,
   nextEventForPhase,
+  solarEventDayOffsets,
 } from './schedule';
+import { shouldMigrateLegacySyncOverride } from './settings-migration';
 
 const GROUP = 'Day/Night Switcher';
 const GROUP_KEY = 'dayNightSwitcher';
@@ -29,6 +44,23 @@ let mixinsByDevice = new WeakMap<any, DayNightMixin>();
 
 function isNum(n: any): n is number {
   return typeof n === 'number' && Number.isFinite(n);
+}
+
+function combineAbortSignals(signals: AbortSignal[]) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+
+  for (const signal of signals) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const signal of signals) signal.removeEventListener('abort', abort);
+    },
+  };
 }
 
 function normaliseSetting(key: string, value: SettingValue): SettingValue {
@@ -107,7 +139,12 @@ function sunKey(lat: number, lon: number, date: Date) {
 }
 
 function getSunTimesCached(date: Date, lat: number, lon: number): SunTimes {
-  const key = sunKey(lat, lon, date);
+  // SunCalc selects a solar cycle from the supplied instant. Normalising to
+  // local noon keeps every lookup for a calendar date on the same cycle and
+  // makes the local-day cache key valid around midnight.
+  const solarDate = new Date(date);
+  solarDate.setHours(12, 0, 0, 0);
+  const key = sunKey(lat, lon, solarDate);
   const hit = sunTimesCache.get(key);
   if (hit) {
     // LRU bump
@@ -116,7 +153,7 @@ function getSunTimesCached(date: Date, lat: number, lon: number): SunTimes {
     return { sunrise: new Date(hit.sunrise), sunset: new Date(hit.sunset) };
   }
 
-  const t = SunCalc.getTimes(date, lat, lon);
+  const t = SunCalc.getTimes(solarDate, lat, lon);
   const value: SunTimes = { sunrise: new Date(t.sunrise), sunset: new Date(t.sunset) };
   sunTimesCache.set(key, value);
 
@@ -149,7 +186,15 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   private initialSyncPending = true;
 
   // Camera actions are serialized and duplicate requests are coalesced.
-  private phaseSwitchQueue = new SerializedPhaseQueue(phase => this.switchPhase(phase));
+  private phaseSwitchQueue = new SerializedPhaseQueue(
+    (phase, context) => this.switchPhase(phase, context),
+  );
+  private phaseAutomation = new PhaseAutomationCoordinator();
+  private automaticGeneration = 0;
+  private activeAutomaticAction?: {
+    phase: DayNightPhase;
+    controller: AbortController;
+  };
   private lifecycleAbort = new AbortController();
 
   // heartbeat watchdog (interval)
@@ -233,13 +278,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       if (!this.settingsState.has(key)) this.settingsState.set(key, val);
     }
 
-    // Preserve the behavior of older versions where the per-camera sync
-    // setting was implicitly coupled to the location/time override.
-    if (this.storage.getItem('overrideSyncOnStartup') == null &&
-        this.getValue('overrideLocationAndTime') === 'true' &&
-        this.storage.getItem('syncOnStartup') != null) {
-      this.settingsState.set('overrideSyncOnStartup', 'true');
-      this.storage.setItem('overrideSyncOnStartup', 'true');
+    // Preserve the behavior of older versions where the location/time
+    // override also selected the per-camera startup-sync value. This includes
+    // its implicit true default when syncOnStartup was never stored.
+    if (shouldMigrateLegacySyncOverride({
+      overrideSyncOnStartupStored: this.storage.getItem('overrideSyncOnStartup') != null,
+      overrideLocationAndTime: this.getValue('overrideLocationAndTime') === 'true',
+    })) {
+      this.saveToStorage('overrideSyncOnStartup', 'true');
     }
 
     this.console?.log?.('[Day/Night] Settings loaded from storage');
@@ -615,6 +661,12 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         this.rescheduleAll().catch(e => this.console?.error?.('[Day/Night] Failed to reschedule:', e));
       } else if (key === 'enabled' && (value === false || value === 'false')) {
         this.console?.log?.('[Day/Night] Disabling schedules');
+        this.scheduleVersion++;
+        const cancelledPhase = this.phaseAutomation.clear();
+        if (cancelledPhase) {
+          this.console?.log?.(`[Day/Night] Cancelled pending ${cancelledPhase} reconciliation because switching was disabled.`);
+        }
+        this.cancelObsoleteAutomaticActions(undefined, true);
         this.clearTimers();
         this.stopHeartbeat();
         this.saveToStorage('preview', 'Switching is disabled');
@@ -779,8 +831,13 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     const use24h    = overrideLoc ? this.getBool('use24h', true) : gBool('use24h', true);
     const syncOnStartup = overrideSync ? this.getBool('syncOnStartup', true) : gBool('syncOnStartup', true);
 
-    const sunriseOffsetMins = (overrideOff ? this.n('sunriseOffsetMins') : gNum('sunriseOffsetMins')) ?? 0;
-    const sunsetOffsetMins  = (overrideOff ? this.n('sunsetOffsetMins')  : gNum('sunsetOffsetMins'))  ?? 0;
+    const clampOffset = (value: number | undefined) => Math.min(720, Math.max(-720, value ?? 0));
+    const sunriseOffsetMins = clampOffset(
+      overrideOff ? this.n('sunriseOffsetMins') : gNum('sunriseOffsetMins'),
+    );
+    const sunsetOffsetMins = clampOffset(
+      overrideOff ? this.n('sunsetOffsetMins') : gNum('sunsetOffsetMins'),
+    );
 
     const retries          = overrideRel ? (this.n('retries') ?? undefined)          : gNum('retries');
     const retryBaseDelayMs = overrideRel ? (this.n('retryBaseDelayMs') ?? undefined) : gNum('retryBaseDelayMs');
@@ -864,6 +921,14 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       // heartbeat replaces one-shot "guard" — keep it running only when enabled
       if (c.enabled) this.startHeartbeat(); else this.stopHeartbeat();
 
+      if (!c.enabled) {
+        this.phaseAutomation.clear();
+        this.cancelObsoleteAutomaticActions(undefined, true);
+        this.console?.log?.('[Day/Night] Scheduling disabled');
+        this.saveToStorage('previewHtml', '<div style="opacity:.7">Switching is disabled.</div>');
+        return;
+      }
+
       const jitter = Math.floor(Math.random() * 60_000);
       const nextRecalc = new Date(now.getTime() + 3600_000 + jitter);
       this.scheduleAt(nextRecalc, () => {
@@ -871,15 +936,12 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
         this.rescheduleAll();
       }, 'recalc');
 
-      if (!c.enabled) {
-        this.console?.log?.('[Day/Night] Scheduling disabled');
-        this.saveToStorage('previewHtml', '<div style="opacity:.7">Switching is disabled.</div>');
-        return;
-      }
-
       if (!isNum(c.latitude!) || !isNum(c.longitude!) ||
           c.latitude! < -90 || c.latitude! > 90 ||
           c.longitude! < -180 || c.longitude! > 180) {
+        this.phaseAutomation.clear();
+        this.cancelObsoleteAutomaticActions(undefined, true);
+        this.initialSyncPending = true;
         this.console?.warn?.('[Day/Night] Invalid latitude/longitude; scheduling skipped.');
         this.saveToStorage('preview', 'Invalid latitude/longitude');
         this.saveToStorage('previewHtml', '<div style="color:#b00">Location not configured (lat/long).</div>');
@@ -898,6 +960,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       const expectedPhase = expectedPhaseAt(events, now);
 
       if (!nextSunriseEvent || !nextSunsetEvent || !expectedPhase) {
+        this.phaseAutomation.clear();
+        this.cancelObsoleteAutomaticActions(undefined, true);
+        this.initialSyncPending = true;
         this.console?.warn?.('[Day/Night] No usable sunrise/sunset events around this date at the configured location.');
         this.saveToStorage('preview', 'No sunrise/sunset events near this date');
         this.saveToStorage('previewHtml', '<div style="color:#b00">No sunrise/sunset events near this date at this location.</div>');
@@ -932,13 +997,27 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
       this.console?.log?.(`[Day/Night] Scheduled: ${preview}`);
 
-      if (!c.syncOnStartup) {
+      const observation = this.phaseAutomation.observeExpectedPhase(expectedPhase, now.getTime());
+      this.cancelObsoleteAutomaticActions(expectedPhase, observation.phaseChanged);
+      const reconciliationActive = this.reconcilePendingPhase(
+        observation.reconciliation,
+        expectedPhase,
+      );
+
+      if (observation.phaseChanged) {
         this.initialSyncPending = false;
-      } else if (this.initialSyncPending) {
+        this.console?.log?.(
+          `[Day/Night] Calculated phase changed from ${observation.previousExpectedPhase} to ${expectedPhase}; applying the missed transition.`,
+        );
+        this.runRecoverableAutomaticPhase(expectedPhase, 'Calculated').catch(() => {});
+      } else if (!c.syncOnStartup) {
+        this.initialSyncPending = false;
+      } else if (!reconciliationActive && this.initialSyncPending) {
         this.console?.log?.(`[Day/Night] Initial phase sync: ${expectedPhase}`);
-        this.requestPhaseSwitch(expectedPhase).then(() => {
+        this.requestPhaseSwitch(expectedPhase, 'automatic').then(() => {
           this.initialSyncPending = false;
         }).catch(e => {
+          if (this.shouldIgnoreAutomaticError(e, expectedPhase)) return;
           this.console?.error?.(`[Day/Night] Initial ${expectedPhase} sync failed; will retry on the next schedule check:`, e?.message || e);
         });
       }
@@ -962,9 +1041,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
   ) {
     const days: SunTimes[] = [];
 
-    // Yesterday is needed for determining the current phase with positive
-    // offsets; two days ahead is needed for the next event with negative ones.
-    for (let dayOffset = -1; dayOffset <= 2; dayOffset++) {
+    // Include enough input days for the configured offsets and for solar
+    // events whose UTC date falls next to the supplied local calendar date.
+    for (const dayOffset of solarEventDayOffsets(sunriseOffsetMins, sunsetOffsetMins)) {
       const date = new Date(now);
       date.setDate(now.getDate() + dayOffset);
       const raw = getSunTimesCached(date, latitude, longitude);
@@ -978,9 +1057,16 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
   private runScheduledPhase(phase: DayNightPhase) {
     const version = this.scheduleVersion;
-    this.requestPhaseSwitch(phase).catch(e => {
-      this.console?.error?.(`[Day/Night] Scheduled ${phase} switch failed:`, e?.message || e);
-    }).finally(() => {
+    const observation = this.phaseAutomation.observeExpectedPhase(phase);
+    if (observation.reconciliation.kind === 'cancelled') {
+      this.console?.log?.(
+        `[Day/Night] Cancelled pending ${observation.reconciliation.phase} reconciliation because the scheduled phase is now ${phase}.`,
+      );
+    }
+    this.initialSyncPending = false;
+    this.cancelObsoleteAutomaticActions(phase, observation.phaseChanged);
+
+    this.runRecoverableAutomaticPhase(phase, 'Scheduled').finally(() => {
       if (this.released || version !== this.scheduleVersion) return;
       this.rescheduleAll().catch(e =>
         this.console?.error?.('[Day/Night] Post-action reschedule failed:', e)
@@ -1010,21 +1096,124 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     }
   }
 
-  private requestPhaseSwitch(phase: DayNightPhase): Promise<void> {
+  private requestPhaseSwitch(
+    phase: DayNightPhase,
+    source: PhaseRequestContext['source'] = 'manual',
+  ): Promise<void> {
     if (this.released) return Promise.reject(new Error('Mixin has been released'));
-    return this.phaseSwitchQueue.request(phase);
+    return this.phaseSwitchQueue.request(phase, {
+      source,
+      scheduleGeneration: source === 'automatic' ? this.automaticGeneration : undefined,
+      expectedPhase: source === 'automatic' ? phase : undefined,
+    });
   }
 
-  private async switchPhase(phase: DayNightPhase) {
+  private reconcilePendingPhase(
+    decision: ReconciliationDecision,
+    expectedPhase: DayNightPhase,
+  ) {
+    if (decision.kind === 'cancelled') {
+      this.console?.log?.(`[Day/Night] Cancelled pending ${decision.phase} reconciliation because the expected phase is now ${expectedPhase}.`);
+      return false;
+    }
+
+    if (decision.kind === 'retry') {
+      this.console?.log?.(`[Day/Night] Retrying pending ${decision.phase} reconciliation.`);
+      this.requestPhaseSwitch(decision.phase, 'automatic').catch(error => {
+        if (this.shouldIgnoreAutomaticError(error, decision.phase)) return;
+        this.phaseAutomation.markAttemptFailure(decision.phase);
+        this.console?.error?.(`[Day/Night] ${decision.phase} reconciliation failed; another hourly attempt will be made:`, error?.message || error);
+      });
+      return true;
+    }
+
+    return decision.kind === 'waiting';
+  }
+
+  private runRecoverableAutomaticPhase(phase: DayNightPhase, label: string) {
+    return this.requestPhaseSwitch(phase, 'automatic').catch(error => {
+      if (this.shouldIgnoreAutomaticError(error, phase)) return;
+
+      this.console?.error?.(`[Day/Night] ${label} ${phase} switch failed:`, error?.message || error);
+      const accepted = this.phaseAutomation.markScheduledFailure(phase);
+      if (accepted !== undefined) {
+        this.console?.warn?.(`[Day/Night] ${phase} reconciliation is pending and will retry during an hourly schedule check.`);
+      }
+    });
+  }
+
+  private shouldIgnoreAutomaticError(error: unknown, phase: DayNightPhase) {
+    return error instanceof PhaseQueueCancellationError
+      || this.released
+      || this.getValue('enabled') !== 'true'
+      || !this.phaseAutomation.isExpectedPhase(phase);
+  }
+
+  private cancelObsoleteAutomaticActions(
+    expectedPhase?: DayNightPhase,
+    invalidateGeneration = false,
+  ) {
+    const shouldCancel = (phase: DayNightPhase) => (
+      invalidateGeneration || expectedPhase === undefined || phase !== expectedPhase
+    );
+    if (invalidateGeneration) this.automaticGeneration++;
+    const cancellation = new PhaseQueueCancellationError(
+      expectedPhase
+        ? `Automatic phase request is obsolete; expected phase is ${expectedPhase}`
+        : 'Automatic phase request cancelled because switching is unavailable',
+    );
+    const cancelled = this.phaseSwitchQueue.cancelQueued(request => (
+      request.context?.source === 'automatic' && shouldCancel(request.phase)
+    ), cancellation);
+
+    let aborted = false;
+    if (this.activeAutomaticAction && shouldCancel(this.activeAutomaticAction.phase)) {
+      this.activeAutomaticAction.controller.abort();
+      aborted = true;
+    }
+
+    if (cancelled || aborted) {
+      this.console?.log?.(
+        `[Day/Night] Cancelled ${cancelled} queued automatic action(s)${aborted ? ' and aborted the active automatic action' : ''}.`,
+      );
+    }
+  }
+
+  private async switchPhase(phase: DayNightPhase, context?: PhaseRequestContext) {
+    const automatic = context?.source === 'automatic';
+    if (automatic && (
+      this.getValue('enabled') !== 'true'
+      || !this.phaseAutomation.isExpectedPhase(phase)
+    )) {
+      throw new PhaseQueueCancellationError(`Automatic ${phase} action is no longer expected`);
+    }
+
+    const automaticController = automatic ? new AbortController() : undefined;
+    if (automaticController) {
+      this.activeAutomaticAction = { phase, controller: automaticController };
+    }
+
     try {
       this.console?.log?.(`[Day/Night] Switching to ${phase} mode...`);
-      await this.invokeAction(phase);
+      await this.invokeAction(phase, automaticController?.signal);
       this.saveToStorage('lastPhase', phase);
       this.saveToStorage('lastPhaseAt', new Date().toISOString());
       this.console?.log?.(`[Day/Night] Successfully switched to ${phase} mode`);
+      if (this.phaseAutomation.markSuccess(phase)) {
+        this.console?.log?.(`[Day/Night] ${phase} reconciliation succeeded.`);
+      }
     } catch (e: any) {
-      this.console?.error?.(`[Day/Night] Failed to switch to ${phase} mode:`, e?.message || e);
+      if (automaticController?.signal.aborted) {
+        throw new PhaseQueueCancellationError(`Automatic ${phase} action was cancelled`);
+      }
+      if (!automatic || !this.shouldIgnoreAutomaticError(e, phase)) {
+        this.console?.error?.(`[Day/Night] Failed to switch to ${phase} mode:`, e?.message || e);
+      }
       throw e;
+    } finally {
+      if (automaticController && this.activeAutomaticAction?.controller === automaticController) {
+        this.activeAutomaticAction = undefined;
+      }
     }
   }
 
@@ -1095,23 +1284,36 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     phase: DayNightPhase,
     response: Response | import('node-fetch').Response,
     logResponses: boolean,
+    signal?: AbortSignal,
   ) {
     const statusLine = `HTTP ${response.status} ${response.statusText}`;
     const contentType = response.headers.get('content-type') || undefined;
     const isTextish = /^(text\/|application\/(json|xml|x-www-form-urlencoded))/.test((contentType || '').toLowerCase()) || !contentType;
 
-    if (logResponses && isTextish) {
-      const body = await this.readResponseBodyLimited(response);
-      this.logBodyChunks(phase, statusLine, body.text, contentType, body.truncated);
-    } else {
-      if (logResponses) this.logBodyChunks(phase, statusLine, '', contentType);
+    try {
+      if (logResponses && isTextish) {
+        const body = await this.readResponseBodyLimited(response);
+        this.logBodyChunks(phase, statusLine, body.text, contentType, body.truncated);
+      } else {
+        if (logResponses) this.logBodyChunks(phase, statusLine, '', contentType);
+        await this.discardResponseBody(response);
+      }
+    } catch (error: any) {
+      // Response logging is diagnostic. Once a successful status has arrived,
+      // a malformed, truncated, or timed-out body must not repeat the action.
+      if (!signal?.aborted) {
+        this.console?.warn?.(
+          `[Day/Night] ${phase} response body could not be logged:`,
+          error?.message || error,
+        );
+      }
       await this.discardResponseBody(response);
     }
 
     if (!response.ok) throw new Error(statusLine);
   }
 
-  private async invokeAction(phase: DayNightPhase) {
+  private async invokeAction(phase: DayNightPhase, actionSignal?: AbortSignal) {
     const c = this.readConfig();
     const action = (phase === 'day' ? c.day : c.night) || {};
 
@@ -1124,26 +1326,57 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     if (action.contentType && bodyAllowed) headers['Content-Type'] = action.contentType;
     this.normaliseAndMergeHeaders(headers, action.headers);
 
-    await withRetries(async () => {
-      const response = await sendCameraRequest({
-        url: action.url!,
-        method,
-        headers,
-        body: bodyAllowed && action.body ? action.body : undefined,
-        authType: c.authType,
-        username: c.username,
-        password: c.password,
-        lifecycleSignal: this.lifecycleAbort.signal,
+    const linkedAbort = combineAbortSignals([
+      this.lifecycleAbort.signal,
+      ...(actionSignal ? [actionSignal] : []),
+    ]);
+
+    try {
+      await withRetries(async () => {
+        try {
+          await sendCameraRequest({
+            url: action.url!,
+            method,
+            headers,
+            body: bodyAllowed && action.body ? action.body : undefined,
+            authType: c.authType,
+            username: c.username,
+            password: c.password,
+            lifecycleSignal: linkedAbort.signal,
+          }, undefined, async (response, signal) => {
+            await this.handleResponse(phase, response, c.logResponses, signal);
+          });
+        } catch (error) {
+          if (error instanceof CameraResponseConsumerError) {
+            if (error.response.ok && !linkedAbort.signal.aborted) {
+              this.console?.warn?.(
+                `[Day/Night] ${phase} response body processing ended after a successful HTTP status:`,
+                (error.cause as any)?.message || error.cause,
+              );
+              this.discardResponseBody(error.response).catch(() => {});
+              return;
+            }
+            if (!error.response.ok) {
+              throw new Error(
+                `HTTP ${error.response.status} ${error.response.statusText}`,
+                { cause: error.cause },
+              );
+            }
+            throw error.cause;
+          }
+          throw error;
+        }
+      }, {
+        attempts: c.retries,
+        baseDelayMs: c.retryBaseDelayMs,
+        signal: linkedAbort.signal,
+        onRetry: (attempt, totalAttempts, delayMs) => {
+          this.console?.log?.(`[Day/Night] Retry ${attempt}/${totalAttempts} after ${delayMs}ms delay`);
+        },
       });
-      await this.handleResponse(phase, response, c.logResponses);
-    }, {
-      attempts: c.retries,
-      baseDelayMs: c.retryBaseDelayMs,
-      signal: this.lifecycleAbort.signal,
-      onRetry: (attempt, totalAttempts, delayMs) => {
-        this.console?.log?.(`[Day/Night] Retry ${attempt}/${totalAttempts} after ${delayMs}ms delay`);
-      },
-    });
+    } finally {
+      linkedAbort.dispose();
+    }
   }
 
   private safeTimeZone(tz?: string): string | undefined {

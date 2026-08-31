@@ -20,6 +20,22 @@ export interface CameraRequest {
   lifecycleSignal?: AbortSignal;
 }
 
+export type CameraResponseConsumer<T> = (
+  response: Response,
+  signal: AbortSignal,
+) => Promise<T>;
+
+export class CameraResponseConsumerError extends Error {
+  readonly response: Response;
+
+  constructor(response: Response, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Camera response consumption failed: ${detail}`, { cause });
+    this.name = 'CameraResponseConsumerError';
+    this.response = response;
+  }
+}
+
 export async function withRetries<T>(
   work: () => Promise<T>,
   options: {
@@ -44,6 +60,7 @@ export async function withRetries<T>(
       return await work();
     } catch (error) {
       lastError = error;
+      if (options.signal?.aborted) throw error;
       if (index >= attempts - 1) break;
 
       const jitter = Math.floor(random() * 250);
@@ -86,18 +103,43 @@ export async function withRequestTimeout<T>(
   else lifecycleSignal?.addEventListener('abort', abortForLifecycle, { once: true });
 
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let rejectForAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectForAbort = () => {
+      const error = new Error('The operation was aborted');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    if (controller.signal.aborted) rejectForAbort();
+    else controller.signal.addEventListener('abort', rejectForAbort, { once: true });
+  });
+
   try {
-    return await work(controller.signal);
+    return await Promise.race([
+      work(controller.signal),
+      aborted,
+    ]);
   } finally {
     clearTimeout(timer);
+    if (rejectForAbort) controller.signal.removeEventListener('abort', rejectForAbort);
     lifecycleSignal?.removeEventListener('abort', abortForLifecycle);
   }
 }
 
-export async function sendCameraRequest(
+export function sendCameraRequest(
+  request: CameraRequest,
+  dependencies?: RequestDependencies,
+): Promise<Response>;
+export function sendCameraRequest<T>(
+  request: CameraRequest,
+  dependencies: RequestDependencies | undefined,
+  consumeResponse: CameraResponseConsumer<T>,
+): Promise<T>;
+export async function sendCameraRequest<T>(
   request: CameraRequest,
   dependencies: RequestDependencies = {},
-): Promise<Response> {
+  consumeResponse?: CameraResponseConsumer<T>,
+): Promise<Response | T> {
   const requestFetch = dependencies.fetch ?? fetch;
   const createDigestClient = dependencies.createDigestClient ??
     ((username: string, password: string) => new DigestClient(username, password));
@@ -113,11 +155,25 @@ export async function sendCameraRequest(
   };
   if (request.body !== undefined) init.body = request.body;
 
-  return withRequestTimeout(async signal => {
-    if (request.authType === 'digest') {
-      const client = createDigestClient(request.username || '', request.password || '');
-      return client.fetch(request.url, { ...init, signal } as any) as Promise<Response>;
+  let receivedResponse: Response | undefined;
+  try {
+    return await withRequestTimeout(async signal => {
+      let response: Response;
+      if (request.authType === 'digest') {
+        const client = createDigestClient(request.username || '', request.password || '');
+        response = await client.fetch(request.url, { ...init, signal } as any) as Response;
+      } else {
+        response = await requestFetch(request.url, { ...init, signal });
+      }
+      receivedResponse = response;
+
+      if (consumeResponse) return consumeResponse(response, signal);
+      return response;
+    }, request.timeoutMs, request.lifecycleSignal);
+  } catch (error) {
+    if (consumeResponse && receivedResponse && !(error instanceof CameraResponseConsumerError)) {
+      throw new CameraResponseConsumerError(receivedResponse, error);
     }
-    return requestFetch(request.url, { ...init, signal });
-  }, request.timeoutMs, request.lifecycleSignal);
+    throw error;
+  }
 }

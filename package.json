@@ -43,7 +43,7 @@
     "rollup": true
   },
   "dependencies": {
-    "@scrypted/sdk": "^0.5.29",
+    "@scrypted/sdk": "^0.5.59",
     "digest-fetch": "3.1.1",
     "node-fetch": "2.6.9",
     "suncalc": "1.9.0"
