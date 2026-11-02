@@ -1,4 +1,4 @@
-import {
+import sdk, {
   ScryptedDeviceBase,
   MixinProvider,
   ScryptedInterface,
@@ -36,10 +36,12 @@ import {
   solarEventDayOffsets,
 } from './schedule';
 import { shouldMigrateLegacySyncOverride } from './settings-migration';
+import { isMixinProviderApplied } from './mixin-lifecycle';
 
 const GROUP = 'Day/Night Switcher';
 const GROUP_KEY = 'dayNightSwitcher';
 const MAX_DELAY_MS = 2_147_483_647;
+const { systemManager } = sdk;
 
 const mixinsById = new Map<string, DayNightMixin>();
 let mixinsByDevice = new WeakMap<any, DayNightMixin>();
@@ -1707,6 +1709,16 @@ export default class DayNightProvider extends ScryptedDeviceBase implements Mixi
   }
 
   async releaseMixin(id: string, mixinDevice: any): Promise<void> {
+    // Scrypted may rebuild a device's mixin chain by calling getMixin before
+    // delivering the release callback for the previous instance. In that
+    // ordering, the maps already point at the replacement. Do not release it
+    // while this provider is still applied to the current device.
+    const currentDevice = systemManager.getDeviceById(id);
+    if (isMixinProviderApplied(this.id, currentDevice)) {
+      this.console?.debug?.(`[Day/Night] Ignoring stale release for device ${id}; mixin is still applied.`);
+      return;
+    }
+
     const inst = mixinsByDevice.get(mixinDevice) ?? mixinsById.get(String(id));
     if (!inst) {
       return;
