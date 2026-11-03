@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.9 - 2026-11-03
+
+* Prevented stale Scrypted mixin release callbacks from cancelling schedules on replacement camera mixins.
+* Removed the static relative countdown from the schedule preview because it became stale between refreshes.
+
 ## 1.0.8 - 2026-08-31
 
 * Improved sunrise and sunset scheduling across offsets, restarts, and long-running sessions.

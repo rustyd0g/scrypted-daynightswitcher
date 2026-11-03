@@ -1,6 +1,6 @@
 {
   "name": "@rustyd0g/scrypted-daynightswitcher",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Per-camera sunrise/sunset day/night profile switcher.",
   "author": "rustyd0g",
   "license": "MIT",
