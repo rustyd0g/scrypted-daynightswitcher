@@ -989,7 +989,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
       const overrideLoc = this.getBool('overrideLocationAndTime', false);
       const overrideOff = this.getBool('overrideOffsets', false);
-      const previewHtml = this.buildPreviewHtml(nextSunrise, nextSunset, now, c.timeZone, {
+      const previewHtml = this.buildPreviewHtml(nextSunrise, nextSunset, c.timeZone, {
         lat: c.latitude!,
         lon: c.longitude!,
         locSource: overrideLoc ? 'camera' : 'global',
@@ -1412,22 +1412,9 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
     });
   }
 
-  private formatRelativeShort(when: Date, now = new Date()) {
-    let ms = when.getTime() - now.getTime();
-    const past = ms < 0;
-    ms = Math.abs(ms);
-    const h = Math.floor(ms / 3_600_000);
-    const m = Math.floor((ms % 3_600_000) / 60_000);
-    const parts: string[] = [];
-    if (h) parts.push(`${h}h`);
-    if (m || !h) parts.push(`${m}m`);
-    return past ? `${parts.join(' ')} ago` : `in ${parts.join(' ')}`;
-  }
-
   private buildPreviewHtml(
     nextSunrise: Date,
     nextSunset: Date,
-    now: Date,
     tzLabel: string | undefined,
     meta: {
       lat: number;
@@ -1468,7 +1455,6 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
       <div style="margin:6px 0 10px">
         <strong>Next switch:</strong> ${icoHeader(nextIsSunrise ? '☀️' : '🌙')} ${nextPhase}
         at <b>${this.formatLocal(nextWhen)}</b>${tz}
-        <span style="opacity:.7">(${this.formatRelativeShort(nextWhen, now)})</span>
       </div>
       <div style="margin:0 0 10px">
         <strong>Last successful action:</strong> ${lastSuccess}
@@ -1516,7 +1502,7 @@ class DayNightMixin extends SettingsMixinDeviceBase<any> {
 
     const overrideLoc = this.getBool('overrideLocationAndTime', false);
     const overrideOff = this.getBool('overrideOffsets', false);
-    const html = this.buildPreviewHtml(nextSunrise, nextSunset, now, c.timeZone, {
+    const html = this.buildPreviewHtml(nextSunrise, nextSunset, c.timeZone, {
       lat: c.latitude!,
       lon: c.longitude!,
       locSource: overrideLoc ? 'camera' : 'global',
